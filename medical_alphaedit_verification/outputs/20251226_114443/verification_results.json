@@ -1,0 +1,59 @@
+{
+  "causal_tracing": {
+    "focused_entropy": 1.6019866466522217,
+    "dispersed_entropy": 5.283203601837158,
+    "top_components": [
+      [
+        52,
+        8
+      ],
+      [
+        50,
+        9
+      ],
+      [
+        51,
+        8
+      ],
+      [
+        50,
+        8
+      ],
+      [
+        53,
+        8
+      ]
+    ],
+    "fault_matrix_shape": [
+      196,
+      12
+    ]
+  },
+  "null_space": {
+    "null_space_dim": 44,
+    "rank": 20,
+    "symmetry_error": 0.0,
+    "idempotence_error": 6.2155918008230385e-15,
+    "correction_error": 1.026192759395312e-07,
+    "preservation_error": 2.0477410937328096e-08,
+    "final_preservation": 5.617069164781087e-09
+  },
+  "framework": {
+    "Fault Localization": {
+      "Patches analyzed": 196,
+      "Layers analyzed": 12,
+      "Critical components found": 5
+    },
+    "Null-Space Projection": {
+      "Feature dimension": 768,
+      "Covariance rank": 50,
+      "Null space dimension": 718
+    },
+    "Weight Update": {
+      "Update norm": 0.29898396197267896,
+      "Correction achieved": true,
+      "Original prediction": 7,
+      "Corrected prediction": 3
+    }
+  }
+}
