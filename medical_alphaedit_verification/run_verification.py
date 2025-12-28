@@ -19,7 +19,7 @@ import json
 import logging
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, List
+from typing import Dict, List, Optional
 import numpy as np
 
 # Add src to path
@@ -179,7 +179,13 @@ def finetune_model(
     return metrics
 
 
-def run_medmnist_verification(output_dir: Path) -> dict:
+def run_medmnist_verification(
+    output_dir: Path,
+    use_real_causal_tracing: bool = False,
+    causal_tracing_max_patches: int = 20,
+    checkpoint_dir: Optional[Path] = None,
+    force_retrain: bool = False
+) -> dict:
     """
     Run verification using MedMNIST dataset.
 
@@ -188,6 +194,14 @@ def run_medmnist_verification(output_dir: Path) -> dict:
 
     Args:
         output_dir: Directory to save outputs
+        use_real_causal_tracing: If True, use real Corrupt-Restore causal tracing
+                                  (slower but more accurate). If False, use random
+                                  simulation for faster demo.
+        causal_tracing_max_patches: Maximum patches to analyze per layer when using
+                                     real causal tracing (for speed control).
+        checkpoint_dir: Directory to save/load model checkpoints. If None, uses
+                        default location (medical_alphaedit_verification/checkpoints).
+        force_retrain: If True, retrain even if checkpoint exists.
 
     Returns:
         Dictionary containing all verification results
@@ -278,18 +292,56 @@ def run_medmnist_verification(output_dir: Path) -> dict:
         logger.error(f"Failed to load model: {e}")
         raise
 
-    # Fine-tune model on PathMNIST
-    print("\n[3/7] Fine-tuning model on PathMNIST...")
-    print("   (This is essential for AlphaEdit - model must learn task-specific features)")
+    # Setup checkpoint directory
+    if checkpoint_dir is None:
+        checkpoint_dir = Path(__file__).parent / 'checkpoints'
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = checkpoint_dir / 'vit_pathmnist_finetuned.pt'
 
-    finetune_metrics = finetune_model(
-        model=model,
-        train_loader=train_loader,
-        device=device,
-        num_epochs=3,
-        lr=1e-4,
-        verbose=True
-    )
+    # Check if we can load from checkpoint
+    loaded_from_checkpoint = False
+    if checkpoint_path.exists() and not force_retrain:
+        print("\n[3/7] Loading fine-tuned model from checkpoint...")
+        print(f"   Checkpoint: {checkpoint_path}")
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location=device)
+            model.load_state_dict(checkpoint['model_state_dict'])
+            finetune_metrics = checkpoint.get('metrics', {
+                'epochs': 'unknown',
+                'lr': 'unknown',
+                'losses': [],
+                'accuracies': [],
+                'loaded_from_checkpoint': True
+            })
+            finetune_metrics['loaded_from_checkpoint'] = True
+            print(f"   Loaded successfully! (trained accuracy: {checkpoint.get('accuracy', 'unknown')})")
+            loaded_from_checkpoint = True
+        except Exception as e:
+            logger.warning(f"Failed to load checkpoint: {e}")
+            print("   Failed to load checkpoint, will retrain...")
+
+    if not loaded_from_checkpoint:
+        # Fine-tune model on PathMNIST
+        print("\n[3/7] Fine-tuning model on PathMNIST...")
+        print("   (This is essential for AlphaEdit - model must learn task-specific features)")
+
+        finetune_metrics = finetune_model(
+            model=model,
+            train_loader=train_loader,
+            device=device,
+            num_epochs=3,
+            lr=1e-4,
+            verbose=True
+        )
+
+        # Save checkpoint
+        print(f"   Saving checkpoint to: {checkpoint_path}")
+        torch.save({
+            'model_state_dict': model.state_dict(),
+            'metrics': finetune_metrics,
+            'accuracy': finetune_metrics['accuracies'][-1] if finetune_metrics['accuracies'] else None
+        }, checkpoint_path)
+        finetune_metrics['checkpoint_saved'] = str(checkpoint_path)
 
     results['finetuning'] = finetune_metrics
 
@@ -354,37 +406,86 @@ def run_medmnist_verification(output_dir: Path) -> dict:
         # Initialize causal tracer
         tracer = CausalTracer(model, device)
 
-        # Run simplified fault localization
-        print("   Running fault localization...")
-
-        # Get model prediction
-        with torch.no_grad():
-            output = model(sample_image)
-            pred_scores = output.cpu().numpy().flatten()
-
-        # Simulate fault scores (full analysis would be time-consuming)
         num_patches = 196
         num_layers = 12
-        fault_scores = np.random.exponential(0.1, (num_patches, num_layers))
 
-        # Find top components
-        flat_scores = fault_scores.flatten()
-        top_5_indices = np.argsort(flat_scores)[-5:][::-1]
+        if use_real_causal_tracing:
+            # ═══════════════════════════════════════════════════════════════
+            # Real Corrupt-Restore causal tracing
+            # ═══════════════════════════════════════════════════════════════
+            print(f"   Running REAL fault localization (max_patches={causal_tracing_max_patches})...")
+            print("   This may take a few minutes...")
 
-        print(f"   Top 5 critical components:")
-        for rank, idx in enumerate(top_5_indices, 1):
-            patch_idx = idx // num_layers
-            layer_idx = idx % num_layers
-            score = fault_scores[patch_idx, layer_idx]
-            print(f"      {rank}. Patch {patch_idx}, Layer {layer_idx}: score = {score:.4f}")
+            import time
+            start_time = time.time()
 
-        results['causal_tracing'] = {
-            'sample_true_label': sample_label,
-            'sample_predicted': sample_info['predicted'],
-            'num_patches_analyzed': num_patches,
-            'num_layers_analyzed': num_layers,
-            'top_components': [(idx // num_layers, idx % num_layers) for idx in top_5_indices]
-        }
+            # Run actual fault localization
+            fault_result = tracer.localize_faults(
+                image=sample_image,
+                top_m=5,
+                verbose=True,
+                method='restore',
+                max_patches=causal_tracing_max_patches
+            )
+
+            elapsed_time = time.time() - start_time
+            print(f"   Fault localization completed in {elapsed_time:.1f} seconds")
+
+            # Extract results
+            fault_scores = fault_result.fault_scores
+            critical_components = fault_result.critical_components
+
+            print("   Top 5 critical components (REAL):")
+            for rank, (patch_idx, layer_idx, component_type) in enumerate(critical_components[:5], 1):
+                if component_type == 'mlp':
+                    score = fault_result.mlp_fault_scores[patch_idx, layer_idx]
+                else:
+                    score = fault_result.msa_fault_scores[patch_idx, layer_idx]
+                print(f"      {rank}. Patch {patch_idx}, Layer {layer_idx}, {component_type.upper()}: score = {score:.4f}")
+
+            results['causal_tracing'] = {
+                'method': 'real_corrupt_restore',
+                'sample_true_label': sample_label,
+                'sample_predicted': sample_info['predicted'],
+                'num_patches_analyzed': causal_tracing_max_patches,
+                'num_layers_analyzed': num_layers,
+                'elapsed_time_seconds': elapsed_time,
+                'critical_components': [
+                    {'patch': patch, 'layer': layer, 'type': comp_type}
+                    for patch, layer, comp_type in critical_components[:5]
+                ],
+                'top_components': [(patch, layer) for patch, layer, _ in critical_components[:5]]
+            }
+
+        else:
+            # ═══════════════════════════════════════════════════════════════
+            # Simulated fault scores (fast demo mode)
+            # ═══════════════════════════════════════════════════════════════
+            print("   Running SIMULATED fault localization (fast demo mode)...")
+            print("   (Use --real-causal-tracing flag for actual Corrupt-Restore analysis)")
+
+            # Simulate fault scores
+            fault_scores = np.random.exponential(0.1, (num_patches, num_layers))
+
+            # Find top components
+            flat_scores = fault_scores.flatten()
+            top_5_indices = np.argsort(flat_scores)[-5:][::-1]
+
+            print("   Top 5 critical components (SIMULATED):")
+            for rank, idx in enumerate(top_5_indices, 1):
+                patch_idx = idx // num_layers
+                layer_idx = idx % num_layers
+                score = fault_scores[patch_idx, layer_idx]
+                print(f"      {rank}. Patch {patch_idx}, Layer {layer_idx}: score = {score:.4f}")
+
+            results['causal_tracing'] = {
+                'method': 'simulated',
+                'sample_true_label': sample_label,
+                'sample_predicted': sample_info['predicted'],
+                'num_patches_analyzed': num_patches,
+                'num_layers_analyzed': num_layers,
+                'top_components': [(idx // num_layers, idx % num_layers) for idx in top_5_indices]
+            }
 
         tracer.cleanup()
 
@@ -531,12 +632,22 @@ def run_medmnist_verification(output_dir: Path) -> dict:
     return results
 
 
-def run_full_verification(output_dir: Path) -> dict:
+def run_full_verification(
+    output_dir: Path,
+    use_real_causal_tracing: bool = False,
+    causal_tracing_max_patches: int = 20,
+    checkpoint_dir: Optional[Path] = None,
+    force_retrain: bool = False
+) -> dict:
     """
     Run both synthetic and MedMNIST verification.
 
     Args:
         output_dir: Directory to save outputs
+        use_real_causal_tracing: If True, use real Corrupt-Restore causal tracing
+        causal_tracing_max_patches: Maximum patches to analyze per layer
+        checkpoint_dir: Directory to save/load model checkpoints
+        force_retrain: If True, retrain even if checkpoint exists
 
     Returns:
         Combined verification results
@@ -547,7 +658,13 @@ def run_full_verification(output_dir: Path) -> dict:
 
     results = {
         'synthetic': run_synthetic_verification(output_dir / 'synthetic'),
-        'medmnist': run_medmnist_verification(output_dir / 'medmnist')
+        'medmnist': run_medmnist_verification(
+            output_dir / 'medmnist',
+            use_real_causal_tracing=use_real_causal_tracing,
+            causal_tracing_max_patches=causal_tracing_max_patches,
+            checkpoint_dir=checkpoint_dir,
+            force_retrain=force_retrain
+        )
     }
 
     return results
@@ -563,8 +680,17 @@ Examples:
     # Run synthetic verification only (no external dependencies)
     python run_verification.py --mode synthetic
 
-    # Run verification with MedMNIST dataset
+    # Run verification with MedMNIST dataset (simulated causal tracing, fast)
     python run_verification.py --mode medmnist
+
+    # Run verification with REAL causal tracing (slower but accurate)
+    python run_verification.py --mode medmnist --real-causal-tracing
+
+    # Force retraining even if checkpoint exists
+    python run_verification.py --mode medmnist --force-retrain
+
+    # Use custom checkpoint directory
+    python run_verification.py --mode medmnist --checkpoint-dir ./my_checkpoints
 
     # Run full verification
     python run_verification.py --mode full
@@ -594,6 +720,32 @@ Examples:
         help='Skip generating visualization plots'
     )
 
+    parser.add_argument(
+        '--real-causal-tracing',
+        action='store_true',
+        help='Use real Corrupt-Restore causal tracing instead of simulation (slower but accurate)'
+    )
+
+    parser.add_argument(
+        '--causal-tracing-max-patches',
+        type=int,
+        default=20,
+        help='Maximum patches to analyze per layer when using real causal tracing (default: 20)'
+    )
+
+    parser.add_argument(
+        '--checkpoint-dir',
+        type=Path,
+        default=None,
+        help='Directory to save/load model checkpoints (default: ./checkpoints)'
+    )
+
+    parser.add_argument(
+        '--force-retrain',
+        action='store_true',
+        help='Force retraining even if checkpoint exists'
+    )
+
     args = parser.parse_args()
 
     # Create output directory
@@ -607,14 +759,33 @@ Examples:
     print(f"\nMode: {args.mode}")
     print(f"Output directory: {output_dir}")
     print(f"Timestamp: {timestamp}")
+    if args.mode in ['medmnist', 'full']:
+        print(f"Real causal tracing: {args.real_causal_tracing}")
+        if args.real_causal_tracing:
+            print(f"Causal tracing max patches: {args.causal_tracing_max_patches}")
+        print(f"Force retrain: {args.force_retrain}")
+        if args.checkpoint_dir:
+            print(f"Checkpoint directory: {args.checkpoint_dir}")
 
     # Run verification based on mode
     if args.mode == 'synthetic':
         results = run_synthetic_verification(output_dir)
     elif args.mode == 'medmnist':
-        results = run_medmnist_verification(output_dir)
+        results = run_medmnist_verification(
+            output_dir,
+            use_real_causal_tracing=args.real_causal_tracing,
+            causal_tracing_max_patches=args.causal_tracing_max_patches,
+            checkpoint_dir=args.checkpoint_dir,
+            force_retrain=args.force_retrain
+        )
     else:
-        results = run_full_verification(output_dir)
+        results = run_full_verification(
+            output_dir,
+            use_real_causal_tracing=args.real_causal_tracing,
+            causal_tracing_max_patches=args.causal_tracing_max_patches,
+            checkpoint_dir=args.checkpoint_dir,
+            force_retrain=args.force_retrain
+        )
 
     # Save results to JSON
     results_file = output_dir / 'verification_results.json'

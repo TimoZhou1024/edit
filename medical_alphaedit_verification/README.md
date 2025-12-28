@@ -113,6 +113,42 @@ uv run python run_verification.py --mode full --output-dir ./results
 | `--mode` | Verification mode: `synthetic`, `medmnist`, or `full` | `synthetic` |
 | `--output-dir` | Directory for output files | `./outputs` |
 | `--no-visualizations` | Skip generating plots | `False` |
+| `--real-causal-tracing` | Use real Corrupt-Restore causal tracing (slower but accurate) | `False` |
+| `--causal-tracing-max-patches` | Max patches per layer for real causal tracing | `20` |
+| `--checkpoint-dir` | Directory to save/load model checkpoints | `./checkpoints` |
+| `--force-retrain` | Force retraining even if checkpoint exists | `False` |
+
+### Model Checkpoints
+
+Fine-tuned models are automatically saved to avoid retraining:
+
+```bash
+# First run: trains and saves checkpoint
+uv run python run_verification.py --mode medmnist
+# Checkpoint saved to: ./checkpoints/vit_pathmnist_finetuned.pt
+
+# Subsequent runs: loads from checkpoint (fast!)
+uv run python run_verification.py --mode medmnist
+
+# Force retraining
+uv run python run_verification.py --mode medmnist --force-retrain
+
+# Custom checkpoint location
+uv run python run_verification.py --mode medmnist --checkpoint-dir ./my_checkpoints
+```
+
+### Causal Tracing Modes
+
+```bash
+# Fast mode: simulated fault scores (default)
+uv run python run_verification.py --mode medmnist
+
+# Accurate mode: real Corrupt-Restore causal tracing
+uv run python run_verification.py --mode medmnist --real-causal-tracing
+
+# Custom patch limit for speed/accuracy tradeoff
+uv run python run_verification.py --mode medmnist --real-causal-tracing --causal-tracing-max-patches 50
+```
 
 ## Verification Results
 
