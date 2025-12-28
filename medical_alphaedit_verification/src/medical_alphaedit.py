@@ -10,18 +10,22 @@ The workflow follows Section 4.3 of the paper:
 3. Retrieve reference activations from correct samples
 4. Apply null-space projected weight updates
 5. Verify correction while maintaining general performance
+
+Key Fix: Activations are now collected from MLP fc1 layer (dim=3072)
+instead of output layer (dim=num_classes), enabling proper null-space editing.
 """
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Union, Any
 from dataclasses import dataclass
 import logging
 from pathlib import Path
 
 from .causal_tracing import CausalTracer, FaultLocalizationResult
-from .null_space_projection import NullSpaceProjector, WeightUpdateResult
+from .null_space_projection import NullSpaceProjector, WeightUpdateResult, NullSpaceProjectionResult
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -34,7 +38,7 @@ class EditingResult:
     original_prediction: np.ndarray
     corrected_prediction: np.ndarray
     target_label: int
-    fault_localization: FaultLocalizationResult
+    fault_localization: Optional[FaultLocalizationResult]
     weight_updates: List[WeightUpdateResult]
     num_edits: int
     total_weight_change: float
@@ -54,6 +58,9 @@ class MedicalAlphaEdit:
     - No retraining required
     - Preserves performance on correct samples
     - Provides theoretical guarantees via null-space constraints
+
+    IMPORTANT: This implementation collects activations from MLP fc1 layer
+    (dimension 3072 for ViT-B/16) to ensure sufficient null-space for editing.
     """
 
     def __init__(
@@ -62,189 +69,376 @@ class MedicalAlphaEdit:
         device: str = "cuda",
         regularization: float = 1e-6,
         max_edits: int = 10,
-        convergence_threshold: float = 0.01
+        convergence_threshold: float = 0.01,
+        target_layer: int = 10
     ):
         """
         Initialize the Medical AlphaEdit framework.
 
         Args:
-            model: Vision Transformer model to edit
+            model: Vision Transformer model to edit (timm ViT)
             device: Device for computation
             regularization: Lambda for numerical stability
             max_edits: Maximum number of iterative edits
             convergence_threshold: Threshold for considering correction complete
+            target_layer: Which transformer block to edit (0-11 for ViT-B)
         """
         self.model = model
         self.device = device
         self.max_edits = max_edits
         self.convergence_threshold = convergence_threshold
+        self.target_layer = target_layer
 
         # Initialize components
         self.causal_tracer = CausalTracer(model, device)
         self.null_space_projector = NullSpaceProjector(regularization)
 
         # Storage for correct activations (reference database)
-        self.reference_activations: Dict[int, List[np.ndarray]] = {}
+        # Now stores fc1 activations [3072 x num_samples] per class
+        self.reference_activations: Dict[int, np.ndarray] = {}
+
+        # Cache for projection matrices per class
+        self.projection_cache: Dict[int, NullSpaceProjectionResult] = {}
 
         # Track edit history
         self.edit_history: List[EditingResult] = []
 
+        # Verify model structure
+        self._verify_model_structure()
+
+    def _verify_model_structure(self):
+        """Verify the model has expected ViT structure."""
+        if not hasattr(self.model, 'blocks'):
+            logger.warning("Model does not have 'blocks' attribute. "
+                          "Expected timm ViT model structure.")
+            return
+
+        num_blocks = len(self.model.blocks)
+        if self.target_layer >= num_blocks:
+            logger.warning(f"target_layer={self.target_layer} >= num_blocks={num_blocks}. "
+                          f"Setting target_layer to {num_blocks - 1}")
+            self.target_layer = num_blocks - 1
+
+        # Check MLP structure
+        block = self.model.blocks[self.target_layer]
+        if hasattr(block, 'mlp') and hasattr(block.mlp, 'fc1'):
+            fc1 = block.mlp.fc1
+            logger.info(f"Target layer {self.target_layer} MLP fc1: "
+                       f"in={fc1.in_features}, out={fc1.out_features}")
+        else:
+            logger.warning("Could not find MLP.fc1 in target block")
+
     def build_reference_database(
         self,
         dataloader: torch.utils.data.DataLoader,
+        target_layer: Optional[int] = None,
         max_samples_per_class: int = 100
     ) -> Dict[int, int]:
         """
         Build reference database from correctly classified samples.
 
-        This implements the nearest-neighbor search described in Eq. 13
-        for retrieving target activations v*.
+        CRITICAL: This method collects fc1 output activations (dim=3072)
+        instead of model output logits (dim=num_classes).
 
         Args:
             dataloader: DataLoader with (image, label) pairs
+            target_layer: Which layer to collect from (uses self.target_layer if None)
             max_samples_per_class: Maximum samples to store per class
 
         Returns:
             Dictionary mapping class labels to sample counts
         """
-        logger.info("Building reference activation database...")
+        if target_layer is not None:
+            self.target_layer = target_layer
 
-        self.model.train(False)
-        class_counts: Dict[int, int] = {}
+        logger.info(f"Building reference database from layer {self.target_layer} fc1...")
 
-        with torch.no_grad():
-            for images, labels in dataloader:
-                images = images.to(self.device)
-                labels = labels.numpy()
+        self.model.eval()
+        class_activations: Dict[int, List[np.ndarray]] = {}
+        hook_storage = {}
 
-                # Get predictions
-                outputs = self.model(images)
-                predictions = outputs.argmax(dim=1).cpu().numpy()
+        # Register hook on target layer's fc1
+        fc1_module = self.model.blocks[self.target_layer].mlp.fc1
 
-                # Store activations for correctly classified samples
-                for i, (pred, label) in enumerate(zip(predictions, labels)):
-                    if pred == label:
+        def capture_fc1(module, inp, out):
+            hook_storage['fc1'] = out.detach()
+
+        hook = fc1_module.register_forward_hook(capture_fc1)
+
+        try:
+            with torch.no_grad():
+                for images, labels in dataloader:
+                    images = images.to(self.device)
+                    # Handle different label formats
+                    if isinstance(labels, torch.Tensor):
+                        if labels.dim() > 1:
+                            labels = labels.squeeze()
+                        labels_np = labels.cpu().numpy()
+                    else:
+                        labels_np = np.array(labels)
+
+                    # Forward pass captures fc1 output via hook
+                    outputs = self.model(images)
+                    predictions = outputs.argmax(dim=1).cpu().numpy()
+
+                    # fc1_out shape: [batch, num_patches, fc1_dim]
+                    # For ViT-B/16: [batch, 197, 3072]
+                    fc1_out = hook_storage['fc1'].cpu().numpy()
+
+                    # Use CLS token activation (index 0)
+                    # Shape: [batch, 3072]
+                    cls_activations = fc1_out[:, 0, :]
+
+                    for i, (pred, label) in enumerate(zip(predictions, labels_np)):
                         label_int = int(label)
-                        if label_int not in self.reference_activations:
-                            self.reference_activations[label_int] = []
+                        if pred == label_int:  # Correctly classified
+                            if label_int not in class_activations:
+                                class_activations[label_int] = []
 
-                        if len(self.reference_activations[label_int]) < max_samples_per_class:
-                            # Store the output activation
-                            activation = outputs[i].cpu().numpy()
-                            self.reference_activations[label_int].append(activation)
+                            if len(class_activations[label_int]) < max_samples_per_class:
+                                class_activations[label_int].append(cls_activations[i])
 
-                            class_counts[label_int] = class_counts.get(label_int, 0) + 1
+                    # Check if we have enough samples
+                    total_samples = sum(len(v) for v in class_activations.values())
+                    if total_samples >= max_samples_per_class * len(class_activations):
+                        if len(class_activations) >= 5:  # At least 5 classes
+                            break
 
-        logger.info(f"Reference database built with {sum(class_counts.values())} samples "
-                   f"across {len(class_counts)} classes")
+        finally:
+            hook.remove()
+
+        # Convert to matrices [fc1_dim x num_samples]
+        self.reference_activations = {}
+        class_counts = {}
+
+        for label, acts in class_activations.items():
+            if len(acts) > 0:
+                # Stack as [num_samples, fc1_dim] then transpose to [fc1_dim, num_samples]
+                self.reference_activations[label] = np.array(acts).T
+                class_counts[label] = len(acts)
+                logger.info(f"  Class {label}: {len(acts)} samples, "
+                           f"shape {self.reference_activations[label].shape}")
+
+        total = sum(class_counts.values())
+        logger.info(f"Reference database built: {total} samples across {len(class_counts)} classes")
+
+        # Clear projection cache since activations changed
+        self.projection_cache = {}
 
         return class_counts
 
+    def get_projection_matrix(self, target_class: int, verbose: bool = False) -> Optional[NullSpaceProjectionResult]:
+        """
+        Get or compute null-space projection matrix for a class.
+
+        Args:
+            target_class: Class label
+            verbose: Whether to print details
+
+        Returns:
+            NullSpaceProjectionResult or None if class not in database
+        """
+        if target_class in self.projection_cache:
+            return self.projection_cache[target_class]
+
+        if target_class not in self.reference_activations:
+            logger.warning(f"No reference activations for class {target_class}")
+            return None
+
+        K_0 = self.reference_activations[target_class]
+        result = self.null_space_projector.compute_null_space_projection(K_0, verbose=verbose)
+
+        self.projection_cache[target_class] = result
+        return result
+
     def retrieve_target_activation(
         self,
-        faulty_activation: np.ndarray,
-        target_class: int
+        k_star: np.ndarray,
+        target_class: int,
+        method: str = 'nearest'
     ) -> Optional[np.ndarray]:
         """
-        Retrieve target activation v* using nearest-neighbor search (Eq. 13).
+        Retrieve target activation v* for error correction.
 
-        v* = argmin_{v in D} ||faulty_activation - v||_2
+        v* is the desired fc2 output, computed from the nearest correct activation.
 
         Args:
-            faulty_activation: The faulty activation to correct
+            k_star: Faulty fc1 activation [fc1_dim]
             target_class: The correct class label
+            method: 'nearest' for nearest-neighbor, 'gradient' for optimization
 
         Returns:
-            Target activation from reference database, or None if not found
+            Target activation v* [fc2_out_dim] or None
         """
         if target_class not in self.reference_activations:
-            logger.warning(f"No reference activations found for class {target_class}")
+            logger.warning(f"No reference activations for class {target_class}")
             return None
 
-        references = self.reference_activations[target_class]
-        if len(references) == 0:
-            return None
+        K_0 = self.reference_activations[target_class]  # [fc1_dim x num_samples]
 
-        # Find nearest neighbor
-        min_distance = float('inf')
-        best_reference = None
+        # Get fc2 weight matrix
+        fc2 = self.model.blocks[self.target_layer].mlp.fc2
+        W = fc2.weight.data.cpu().numpy()  # [fc2_out_dim x fc1_dim]
 
-        for ref in references:
-            distance = np.linalg.norm(faulty_activation - ref)
-            if distance < min_distance:
-                min_distance = distance
-                best_reference = ref
+        if method == 'nearest':
+            # Find nearest neighbor in activation space
+            # K_0.T has shape [num_samples, fc1_dim]
+            distances = np.linalg.norm(K_0.T - k_star, axis=1)
+            nearest_idx = np.argmin(distances)
+            k_nearest = K_0[:, nearest_idx]
 
-        return best_reference
+            # v* = W @ k_nearest (what fc2 would output for the correct activation)
+            v_star = W @ k_nearest
+            return v_star
 
-    def get_layer_weights(self, layer_idx: int) -> Optional[Tuple[str, np.ndarray]]:
+        elif method == 'gradient':
+            return self._optimize_target_activation(k_star, W, target_class)
+
+        else:
+            raise ValueError(f"Unknown method: {method}")
+
+    def _optimize_target_activation(
+        self,
+        k_star: np.ndarray,
+        W: np.ndarray,
+        target_class: int,
+        num_steps: int = 100,
+        lr: float = 0.1
+    ) -> np.ndarray:
         """
-        Get weight matrix from specified layer.
+        Optimize v* to maximize probability of target class using gradient descent.
 
         Args:
-            layer_idx: Index of the layer
+            k_star: Faulty activation [fc1_dim]
+            W: Weight matrix [fc2_out_dim x fc1_dim]
+            target_class: Target class label
+            num_steps: Optimization steps
+            lr: Learning rate
 
         Returns:
-            Tuple of (layer_name, weight_matrix) or None
+            Optimized v* [fc2_out_dim]
         """
-        layer_modules = [(n, m) for n, m in self.model.named_modules()
-                        if 'mlp' in n.lower() or 'ffn' in n.lower()]
+        # Initial v* from current W @ k*
+        v_init = W @ k_star
+        v = torch.tensor(v_init, requires_grad=True, dtype=torch.float32, device='cpu')
+        optimizer = torch.optim.Adam([v], lr=lr)
 
-        if layer_idx < len(layer_modules):
-            name, module = layer_modules[layer_idx]
-            for param_name, param in module.named_parameters():
-                if 'weight' in param_name:
-                    return name + '.' + param_name, param.data.cpu().numpy()
+        # Get classifier head weights
+        head_W = self.model.head.weight.data.cpu()  # [num_classes, hidden_dim]
+        head_b = self.model.head.bias.data.cpu() if self.model.head.bias is not None else None
 
-        return None
+        target = torch.tensor([target_class], dtype=torch.long)
+
+        for step in range(num_steps):
+            optimizer.zero_grad()
+
+            # Simulate forward through head
+            if head_b is not None:
+                logits = F.linear(v.unsqueeze(0), head_W, head_b)
+            else:
+                logits = F.linear(v.unsqueeze(0), head_W)
+
+            loss = F.cross_entropy(logits, target)
+            loss.backward()
+            optimizer.step()
+
+        return v.detach().numpy()
+
+    def get_fc1_activation(self, image: torch.Tensor) -> np.ndarray:
+        """
+        Get fc1 output activation for an image.
+
+        Args:
+            image: Input image tensor [1, C, H, W]
+
+        Returns:
+            fc1 activation [fc1_dim] (CLS token)
+        """
+        hook_storage = {}
+        fc1_module = self.model.blocks[self.target_layer].mlp.fc1
+
+        def capture_fc1(module, inp, out):
+            hook_storage['fc1'] = out.detach()
+
+        hook = fc1_module.register_forward_hook(capture_fc1)
+
+        try:
+            with torch.no_grad():
+                self.model(image)
+
+            # [1, num_patches, fc1_dim] -> [fc1_dim]
+            fc1_out = hook_storage['fc1'][0, 0, :].cpu().numpy()
+            return fc1_out
+        finally:
+            hook.remove()
+
+    def get_fc2_weights(self, layer_idx: Optional[int] = None) -> Tuple[str, np.ndarray]:
+        """
+        Get fc2 weight matrix from the specified layer.
+
+        Args:
+            layer_idx: Layer index (uses self.target_layer if None)
+
+        Returns:
+            Tuple of (layer_name, weight_matrix)
+        """
+        if layer_idx is None:
+            layer_idx = self.target_layer
+
+        fc2 = self.model.blocks[layer_idx].mlp.fc2
+        layer_name = f"blocks.{layer_idx}.mlp.fc2.weight"
+        W = fc2.weight.data.cpu().numpy()  # [hidden_dim x fc1_dim] = [768 x 3072]
+        return layer_name, W
 
     def apply_weight_update(
         self,
-        layer_name: str,
-        delta_W: np.ndarray
+        delta_W: np.ndarray,
+        layer_idx: Optional[int] = None
     ):
         """
-        Apply weight update to the model.
+        Apply weight update to fc2 of the target layer.
 
         Args:
-            layer_name: Full name of the parameter to update
-            delta_W: Weight update matrix
+            delta_W: Weight update matrix [hidden_dim x fc1_dim]
+            layer_idx: Layer index (uses self.target_layer if None)
         """
-        # Navigate to the parameter
-        parts = layer_name.split('.')
-        module = self.model
+        if layer_idx is None:
+            layer_idx = self.target_layer
 
-        for part in parts[:-1]:
-            module = getattr(module, part)
-
-        param_name = parts[-1]
-        param = getattr(module, param_name)
+        fc2 = self.model.blocks[layer_idx].mlp.fc2
 
         # Apply update
         with torch.no_grad():
-            param.add_(torch.tensor(delta_W, device=param.device, dtype=param.dtype))
+            fc2.weight.add_(torch.tensor(delta_W, device=fc2.weight.device, dtype=fc2.weight.dtype))
 
     def correct_error(
         self,
         image: torch.Tensor,
         target_label: int,
-        correct_activations: np.ndarray,
-        verbose: bool = True
+        verbose: bool = True,
+        use_causal_tracing: bool = False
     ) -> EditingResult:
         """
-        Main error correction workflow.
+        Main error correction workflow using fc1/fc2 layer editing.
 
         Implements the complete Medical AlphaEdit pipeline:
-        1. Localize faults via causal tracing
-        2. Compute null-space projection from correct activations
-        3. Apply iterative weight updates
-        4. Verify correction
+        1. Get fc1 activation k* for the error sample
+        2. Retrieve or compute target activation v*
+        3. Get null-space projection P from reference activations
+        4. Compute and apply constrained weight update to fc2
+        5. Verify correction
+
+        All operations work in proper dimensions:
+        - k*: [fc1_dim] = [3072] for ViT-B/16
+        - v*: [hidden_dim] = [768] for ViT-B/16
+        - W (fc2.weight): [hidden_dim x fc1_dim] = [768 x 3072]
+        - P: [fc1_dim x fc1_dim] = [3072 x 3072]
 
         Args:
             image: Input image that produces error
             target_label: Correct label for this image
-            correct_activations: Matrix of activations from correct samples
             verbose: Whether to print progress
+            use_causal_tracing: Whether to run full causal tracing (slow)
 
         Returns:
             EditingResult with complete correction information
@@ -260,31 +454,46 @@ class MedicalAlphaEdit:
         if verbose:
             logger.info(f"Original prediction: {original_pred.argmax()}, Target: {target_label}")
 
-        # Step 1: Fault Localization
-        if verbose:
-            logger.info("Step 1: Localizing faults...")
+        # Step 1: Fault Localization (optional, for analysis)
+        fault_result = None
+        if use_causal_tracing:
+            if verbose:
+                logger.info("Step 1: Localizing faults...")
+            fault_result = self.causal_tracer.localize_faults(image, top_m=5, verbose=verbose)
+            if verbose:
+                logger.info(f"Found {len(fault_result.critical_components)} critical components")
 
-        fault_result = self.causal_tracer.localize_faults(image, top_m=5, verbose=verbose)
-
-        if verbose:
-            logger.info(f"Found {len(fault_result.critical_components)} critical components")
-
-        # Step 2: Compute Null-Space Projection
+        # Step 2: Get null-space projection for target class
         if verbose:
             logger.info("Step 2: Computing null-space projection...")
 
-        projection_result = self.null_space_projector.compute_null_space_projection(
-            correct_activations, verbose=verbose
-        )
+        projection_result = self.get_projection_matrix(target_label, verbose=verbose)
+        if projection_result is None:
+            logger.error(f"Cannot correct: no reference activations for class {target_label}")
+            return EditingResult(
+                success=False,
+                original_prediction=original_pred,
+                corrected_prediction=original_pred,
+                target_label=target_label,
+                fault_localization=fault_result,
+                weight_updates=[],
+                num_edits=0,
+                total_weight_change=0,
+                preservation_metrics={'error': 'no_reference_activations'}
+            )
 
-        P = projection_result.projection_matrix
+        P = projection_result.projection_matrix  # [fc1_dim x fc1_dim]
+
+        if verbose:
+            logger.info(f"  Null space dimension: {projection_result.null_space_dim}")
+            logger.info(f"  Projection matrix P shape: {P.shape}")
 
         # Step 3: Iterative Weight Updates
         if verbose:
             logger.info("Step 3: Applying iterative weight updates...")
 
         weight_updates = []
-        total_weight_change = 0
+        total_weight_change = 0.0
 
         for edit_num in range(self.max_edits):
             # Check if already corrected
@@ -297,60 +506,47 @@ class MedicalAlphaEdit:
                     logger.info(f"Correction achieved after {edit_num} edits")
                 break
 
-            # Get faulty activation (current output)
-            k_star = current_output.cpu().numpy().flatten()
+            # Get faulty fc1 activation k* (CLS token)
+            k_star = self.get_fc1_activation(image)  # [fc1_dim] = [3072]
 
-            # Retrieve target activation
-            v_star = self.retrieve_target_activation(k_star, target_label)
+            if verbose and edit_num == 0:
+                logger.info(f"  k* (fc1 activation) shape: {k_star.shape}")
+
+            # Retrieve target activation v*
+            v_star = self.retrieve_target_activation(k_star, target_label, method='nearest')
             if v_star is None:
-                # Use mean of correct activations as fallback
-                v_star = np.mean(correct_activations, axis=1)
+                logger.warning(f"Could not retrieve target activation for class {target_label}")
+                break
 
-            # Get weight matrix from most faulty layer
-            if len(fault_result.layer_indices) > 0:
-                layer_idx = fault_result.layer_indices[0]
-            else:
-                layer_idx = 0
+            if verbose and edit_num == 0:
+                logger.info(f"  v* (target activation) shape: {v_star.shape}")
 
-            layer_info = self.get_layer_weights(layer_idx)
-            if layer_info is None:
-                if verbose:
-                    logger.warning(f"Could not get weights for layer {layer_idx}")
-                continue
+            # Get fc2 weight matrix W
+            layer_name, W = self.get_fc2_weights()  # [hidden_dim x fc1_dim] = [768 x 3072]
 
-            layer_name, W = layer_info
+            if verbose and edit_num == 0:
+                logger.info(f"  W (fc2.weight) shape: {W.shape}")
 
-            # Ensure dimensions match
-            if W.shape[1] != len(k_star):
-                k_star_resized = np.zeros(W.shape[1])
-                k_star_resized[:len(k_star)] = k_star[:W.shape[1]]
-                k_star = k_star_resized
+            # Verify dimensions are correct (no resizing needed!)
+            assert k_star.shape[0] == W.shape[1] == P.shape[0], \
+                f"Dimension mismatch: k*={k_star.shape}, W={W.shape}, P={P.shape}"
+            assert v_star.shape[0] == W.shape[0], \
+                f"Output dimension mismatch: v*={v_star.shape}, W={W.shape}"
 
-            if W.shape[0] != len(v_star):
-                v_star_resized = np.zeros(W.shape[0])
-                v_star_resized[:len(v_star)] = v_star[:W.shape[0]]
-                v_star = v_star_resized
-
-            # Resize P if needed
-            if P.shape[0] != W.shape[1]:
-                P_resized = np.eye(W.shape[1])
-                min_dim = min(P.shape[0], W.shape[1])
-                P_resized[:min_dim, :min_dim] = P[:min_dim, :min_dim]
-                P = P_resized
-
-            # Compute weight update
+            # Compute weight update using null-space projection
             update_result = self.null_space_projector.compute_weight_update(
-                W, k_star, v_star, P, verbose=verbose
+                W, k_star, v_star, P, verbose=(verbose and edit_num == 0)
             )
 
             weight_updates.append(update_result)
             total_weight_change += np.linalg.norm(update_result.delta_W)
 
-            # Apply update
-            self.apply_weight_update(layer_name, update_result.delta_W)
+            # Apply update to fc2.weight
+            self.apply_weight_update(update_result.delta_W)
 
             if verbose:
-                logger.info(f"Edit {edit_num + 1}: Applied update with norm {np.linalg.norm(update_result.delta_W):.4f}")
+                logger.info(f"Edit {edit_num + 1}: ||ΔW||={np.linalg.norm(update_result.delta_W):.4e}, "
+                           f"correction_err={update_result.correction_error:.4e}")
 
         # Get final prediction
         with torch.no_grad():
@@ -364,8 +560,9 @@ class MedicalAlphaEdit:
             'total_edits': len(weight_updates),
             'total_weight_change': total_weight_change,
             'null_space_dim': projection_result.null_space_dim,
-            'avg_correction_error': np.mean([u.correction_error for u in weight_updates]) if weight_updates else 0,
-            'avg_preservation_error': np.mean([u.preservation_error for u in weight_updates]) if weight_updates else 0
+            'covariance_rank': projection_result.rank,
+            'avg_correction_error': float(np.mean([u.correction_error for u in weight_updates])) if weight_updates else 0,
+            'avg_preservation_error': float(np.mean([u.preservation_error for u in weight_updates])) if weight_updates else 0
         }
 
         result = EditingResult(
@@ -442,6 +639,11 @@ def demonstrate_medical_alphaedit():
 
     This provides a complete walkthrough of the algorithm without
     requiring actual medical imaging data.
+
+    Key dimensions for ViT-B/16:
+    - fc1_dim: 3072 (MLP expansion)
+    - hidden_dim: 768 (ViT hidden size)
+    - num_classes: varies (e.g., 9 for PathMNIST)
     """
     print("=" * 70)
     print("MEDICAL ALPHAEDIT FRAMEWORK DEMONSTRATION")
@@ -449,7 +651,7 @@ def demonstrate_medical_alphaedit():
 
     np.random.seed(42)
 
-    # Simulate the framework workflow
+    # Simulate the framework workflow with correct dimensions
     print("\n1. FRAMEWORK INITIALIZATION")
     print("-" * 50)
     print("Initializing components:")
@@ -457,31 +659,37 @@ def demonstrate_medical_alphaedit():
     print("  - Null-Space Projector: For knowledge preservation")
     print("  - Reference Database: For target activation retrieval")
 
-    # Simulate dimensions
+    # Correct dimensions for ViT-B/16
+    fc1_dim = 3072      # fc1 output dimension (MLP expansion)
+    hidden_dim = 768    # ViT hidden dimension (fc2 output)
     num_classes = 10
-    feature_dim = 768  # ViT-B hidden dimension
     num_correct_samples = 50
 
-    print(f"\nConfiguration:")
+    print(f"\nConfiguration (ViT-B/16 dimensions):")
+    print(f"  fc1 dimension: {fc1_dim}")
+    print(f"  hidden dimension: {hidden_dim}")
     print(f"  Number of classes: {num_classes}")
-    print(f"  Feature dimension: {feature_dim}")
     print(f"  Reference samples per class: {num_correct_samples}")
 
-    print("\n2. BUILDING REFERENCE DATABASE")
+    print("\n2. BUILDING REFERENCE DATABASE (fc1 activations)")
     print("-" * 50)
 
-    # Simulate reference activations for each class
+    # Simulate reference fc1 activations for each class
+    # These are collected from correctly classified samples
     reference_db = {}
     for cls in range(num_classes):
-        # Create class-specific activation patterns
-        class_center = np.random.randn(feature_dim)
+        # Create class-specific activation patterns in fc1 space
+        class_center = np.random.randn(fc1_dim) * 0.5
         class_activations = []
         for _ in range(num_correct_samples):
-            activation = class_center + np.random.randn(feature_dim) * 0.1
+            # Each sample's fc1 output (CLS token)
+            activation = class_center + np.random.randn(fc1_dim) * 0.1
             class_activations.append(activation)
         reference_db[cls] = class_activations
 
-    print(f"Reference database: {len(reference_db)} classes, {num_correct_samples} samples each")
+    print(f"Reference database: {len(reference_db)} classes")
+    print(f"  Each sample: fc1 activation of shape [{fc1_dim}]")
+    print(f"  Matrix K_0 per class: [{fc1_dim} x {num_correct_samples}]")
 
     print("\n3. SIMULATING ERROR CORRECTION WORKFLOW")
     print("-" * 50)
@@ -511,82 +719,92 @@ def demonstrate_medical_alphaedit():
         score = fault_scores[patch_idx, layer_idx]
         print(f"    {rank}. Patch {patch_idx}, Layer {layer_idx}: score = {score:.4f}")
 
-    # Step 2: Null-Space Projection
+    # Step 2: Null-Space Projection (using fc1 activations)
     print("\nStep 2: Null-Space Projection")
 
-    # Use correct class activations
-    K_0 = np.array(reference_db[true_label]).T  # [feature_dim x num_samples]
+    # Use correct class fc1 activations
+    K_0 = np.array(reference_db[true_label]).T  # [fc1_dim x num_samples] = [3072 x 50]
     print(f"  Correct activations matrix K_0: {K_0.shape}")
 
     # Compute covariance and SVD
-    covariance = K_0 @ K_0.T
+    covariance = K_0 @ K_0.T  # [3072 x 3072]
     U, S, Vt = np.linalg.svd(covariance, full_matrices=True)
     rank = np.sum(S > 1e-10)
-    null_dim = feature_dim - rank
+    null_dim = fc1_dim - rank
 
+    print(f"  Covariance matrix: {covariance.shape}")
     print(f"  Covariance rank: {rank}")
     print(f"  Null space dimension: {null_dim}")
+    print(f"  Expected: ~{fc1_dim - num_correct_samples} (fc1_dim - num_samples)")
 
-    # Construct projection matrix
+    # Construct projection matrix P
     if null_dim > 0:
-        V_0 = Vt[rank:, :].T
-        P = V_0 @ V_0.T
+        V_0 = Vt[rank:, :].T  # Null space basis
+        P = V_0 @ V_0.T  # [fc1_dim x fc1_dim]
     else:
-        P = np.zeros((feature_dim, feature_dim))
+        P = np.zeros((fc1_dim, fc1_dim))
 
     print(f"  Projection matrix P: {P.shape}")
 
-    # Step 3: Weight Update
-    print("\nStep 3: Weight Update Computation")
+    # Step 3: Weight Update (on fc2)
+    print("\nStep 3: Weight Update Computation (fc2)")
 
-    # Simulate weight matrix
-    d_out = 10  # Output dimension (num classes)
-    W = np.random.randn(d_out, feature_dim) * 0.1
+    # Simulate fc2 weight matrix: [hidden_dim x fc1_dim] = [768 x 3072]
+    W = np.random.randn(hidden_dim, fc1_dim) * 0.02
 
-    # Faulty activation (predicts class 7 instead of 3)
-    k_star = np.zeros(feature_dim)
-    k_star[:100] = reference_db[predicted_label][0][:100]  # Mix of wrong class
+    # Faulty fc1 activation k* (from the misclassified sample)
+    k_star = reference_db[predicted_label][0].copy()  # [3072]
+    k_star += np.random.randn(fc1_dim) * 0.2  # Add some noise
 
-    # Target activation (should predict class 3)
-    v_star = np.zeros(d_out)
-    v_star[true_label] = 1.0  # One-hot for correct class
+    # Current wrong fc2 output
+    wrong_output = W @ k_star  # [768]
+    print(f"  k* (fc1 activation): shape {k_star.shape}")
+    print(f"  W (fc2.weight): shape {W.shape}")
+    print(f"  W @ k* (fc2 output): shape {wrong_output.shape}")
 
-    # Current (wrong) output
-    wrong_output = W @ k_star
-    print(f"  Before correction: argmax(W @ k*) = {wrong_output.argmax()}")
+    # Target activation v* (from nearest correct sample)
+    k_nearest = reference_db[true_label][0]  # Nearest correct fc1 activation
+    v_star = W @ k_nearest  # What fc2 would output for correct activation
 
-    # Compute update using simplified formula
-    residual = v_star - W @ k_star
-    Pk_star = P @ k_star
+    print(f"  v* (target fc2 output): shape {v_star.shape}")
+
+    # Compute update using null-space constraint
+    residual = v_star - W @ k_star  # [768]
+    Pk_star = P @ k_star  # [3072]
     regularization = 1e-6
 
-    # Simplified update for demonstration
+    print(f"\n  Residual ||v* - W @ k*||: {np.linalg.norm(residual):.4f}")
+    print(f"  ||P @ k*|| / ||k*||: {np.linalg.norm(Pk_star) / np.linalg.norm(k_star):.4f}")
+
+    # Compute weight update ΔW
     if np.linalg.norm(Pk_star) > 1e-10:
-        scale = np.dot(k_star, Pk_star) + regularization
-        delta_W = np.outer(residual, Pk_star) / scale
+        k_star_T_P = k_star @ P  # [3072]
+        denominator_matrix = np.outer(k_star, k_star_T_P) + regularization * np.eye(fc1_dim)
+        denominator_inv = np.linalg.inv(denominator_matrix)
+        delta_W = np.outer(residual, k_star_T_P @ denominator_inv)  # [768 x 3072]
     else:
         delta_W = np.zeros_like(W)
 
-    print(f"  Weight update norm: {np.linalg.norm(delta_W):.6f}")
+    print(f"  ΔW shape: {delta_W.shape}")
+    print(f"  ||ΔW||: {np.linalg.norm(delta_W):.6f}")
 
     # Apply update
     W_new = W + delta_W
 
     # Verify correction
     corrected_output = W_new @ k_star
-    print(f"  After correction: argmax((W + dW) @ k*) = {corrected_output.argmax()}")
+    correction_error = np.linalg.norm(corrected_output - v_star)
+    print(f"\n  Correction error ||(W + ΔW) @ k* - v*||: {correction_error:.2e}")
 
-    # Verify preservation
+    # Verify preservation on correct samples
+    print("\n  Preservation check on correct samples:")
     for cls_idx in range(3):
         sample = reference_db[cls_idx][0]
-        sample_resized = np.zeros(feature_dim)
-        sample_resized[:len(sample)] = sample[:feature_dim]
-
-        original_out = W @ sample_resized
-        new_out = W_new @ sample_resized
-
+        original_out = W @ sample
+        new_out = W_new @ sample
         change = np.linalg.norm(new_out - original_out)
-        print(f"  Class {cls_idx} preservation: output change = {change:.6f}")
+        relative_change = change / (np.linalg.norm(original_out) + 1e-10)
+        print(f"    Class {cls_idx}: relative output change = {relative_change:.2e}")
 
     print("\n4. FRAMEWORK METRICS SUMMARY")
     print("-" * 50)
@@ -598,22 +816,25 @@ def demonstrate_medical_alphaedit():
             "Critical components found": 5
         },
         "Null-Space Projection": {
-            "Feature dimension": feature_dim,
+            "Feature dimension": fc1_dim,
             "Covariance rank": rank,
             "Null space dimension": null_dim
         },
         "Weight Update": {
             "Update norm": np.linalg.norm(delta_W),
-            "Correction achieved": corrected_output.argmax() == true_label,
-            "Original prediction": wrong_output.argmax(),
-            "Corrected prediction": corrected_output.argmax()
+            "Correction achieved": correction_error < 1e-4,
+            "Correction error": correction_error,
+            "fc2 weight shape": f"{W.shape}"
         }
     }
 
     for category, values in metrics.items():
         print(f"\n{category}:")
         for key, value in values.items():
-            print(f"  {key}: {value}")
+            if isinstance(value, float):
+                print(f"  {key}: {value:.6f}")
+            else:
+                print(f"  {key}: {value}")
 
     print("\n" + "=" * 70)
     print("MEDICAL ALPHAEDIT DEMONSTRATION COMPLETE")

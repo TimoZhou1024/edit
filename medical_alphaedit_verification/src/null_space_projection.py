@@ -54,16 +54,22 @@ class NullSpaceProjector:
     onto directions orthogonal to the span of correct activations.
     """
 
-    def __init__(self, regularization: float = 1e-6, rank_threshold: float = 1e-10):
+    def __init__(self, regularization: float = 1e-6, rank_threshold: float = 1e-10,
+                 use_relative_threshold: bool = True, relative_threshold: float = 1e-6):
         """
         Initialize the null-space projector.
 
         Args:
             regularization: Lambda parameter for numerical stability (Eq. 12)
-            rank_threshold: Threshold for determining numerical rank
+            rank_threshold: Absolute threshold for determining numerical rank
+            use_relative_threshold: If True, use relative threshold based on max singular value
+            relative_threshold: Threshold relative to max singular value (e.g., 1e-6 means
+                              singular values < max_sv * 1e-6 are considered zero)
         """
         self.regularization = regularization
         self.rank_threshold = rank_threshold
+        self.use_relative_threshold = use_relative_threshold
+        self.relative_threshold = relative_threshold
 
     def compute_covariance_matrix(self, activations: np.ndarray) -> np.ndarray:
         """
@@ -114,8 +120,14 @@ class NullSpaceProjector:
         # Perform SVD: Sigma = U * diag(singular_values) * V^T
         U, singular_values, Vt = np.linalg.svd(covariance, full_matrices=True)
 
-        # Determine numerical rank
-        rank = np.sum(singular_values > self.rank_threshold)
+        # Determine numerical rank using appropriate threshold
+        if self.use_relative_threshold and len(singular_values) > 0 and singular_values[0] > 0:
+            # Use relative threshold: singular values < max_sv * relative_threshold are zero
+            threshold = singular_values[0] * self.relative_threshold
+            rank = np.sum(singular_values > threshold)
+        else:
+            # Use absolute threshold
+            rank = np.sum(singular_values > self.rank_threshold)
 
         if verbose:
             logger.info(f"Numerical rank: {rank} out of {len(singular_values)}")

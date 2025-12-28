@@ -19,6 +19,7 @@ import json
 import logging
 from pathlib import Path
 from datetime import datetime
+from typing import Dict, List
 import numpy as np
 
 # Add src to path
@@ -77,12 +78,113 @@ def run_synthetic_verification(output_dir: Path) -> dict:
     return results
 
 
+def finetune_model(
+    model,
+    train_loader,
+    device: str,
+    num_epochs: int = 3,
+    lr: float = 1e-4,
+    max_batches_per_epoch: int = 200,
+    verbose: bool = True
+) -> dict:
+    """
+    Fine-tune the ViT model on the target dataset.
+
+    This step is essential for Medical AlphaEdit to work correctly:
+    - Pre-trained ImageNet model has random classification head for PathMNIST
+    - Without fine-tuning, fc1 activations don't encode task-specific features
+    - Result: null-space projection cannot effectively preserve knowledge
+
+    After fine-tuning:
+    - Model learns PathMNIST class boundaries
+    - fc1 activations become task-relevant
+    - AlphaEdit can correct individual errors without disrupting learned knowledge
+
+    Args:
+        model: ViT model to fine-tune
+        train_loader: DataLoader with training data
+        device: Device to use
+        num_epochs: Number of training epochs
+        lr: Learning rate
+        max_batches_per_epoch: Max batches per epoch (for faster demo)
+        verbose: Whether to print progress
+
+    Returns:
+        Dictionary with training metrics
+    """
+    import torch
+    import torch.nn.functional as F
+
+    model.train()
+
+    # Use AdamW with weight decay for better generalization
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
+
+    # Cosine annealing learning rate schedule
+    total_steps = num_epochs * min(len(train_loader), max_batches_per_epoch)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=total_steps
+    )
+
+    metrics = {
+        'epochs': num_epochs,
+        'lr': lr,
+        'losses': [],
+        'accuracies': []
+    }
+
+    if verbose:
+        print(f"   Fine-tuning for {num_epochs} epochs with lr={lr}")
+        print(f"   (max {max_batches_per_epoch} batches per epoch for faster demo)")
+
+    for epoch in range(num_epochs):
+        epoch_loss = 0.0
+        correct = 0
+        total = 0
+
+        for batch_idx, (images, labels) in enumerate(train_loader):
+            if batch_idx >= max_batches_per_epoch:
+                break
+
+            images = images.to(device)
+            labels = labels.squeeze().to(device)
+
+            optimizer.zero_grad()
+            outputs = model(images)
+            loss = F.cross_entropy(outputs, labels)
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
+
+            epoch_loss += loss.item()
+            predictions = outputs.argmax(dim=1)
+            correct += (predictions == labels).sum().item()
+            total += len(labels)
+
+        batches_processed = min(batch_idx + 1, max_batches_per_epoch)
+        avg_loss = epoch_loss / batches_processed
+        accuracy = correct / total
+        metrics['losses'].append(avg_loss)
+        metrics['accuracies'].append(accuracy)
+
+        if verbose:
+            print(f"   Epoch {epoch + 1}/{num_epochs}: "
+                  f"loss={avg_loss:.4f}, accuracy={accuracy:.2%}")
+
+    model.eval()
+
+    if verbose:
+        print(f"   Fine-tuning complete. Final accuracy: {metrics['accuracies'][-1]:.2%}")
+
+    return metrics
+
+
 def run_medmnist_verification(output_dir: Path) -> dict:
     """
     Run verification using MedMNIST dataset.
 
     This mode demonstrates the framework on actual medical imaging data,
-    using a pre-trained ViT model to show realistic error correction.
+    using a fine-tuned ViT model to show realistic error correction.
 
     Args:
         output_dir: Directory to save outputs
@@ -128,8 +230,9 @@ def run_medmnist_verification(output_dir: Path) -> dict:
         train_dataset = PathMNIST(split='train', transform=transform, download=True, size=224)
         test_dataset = PathMNIST(split='test', transform=transform, download=True, size=224)
 
-        train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-        test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
+        # Use smaller batch size to avoid memory issues
+        train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True)
+        test_loader = DataLoader(test_dataset, batch_size=16, shuffle=False)
 
         print(f"   Train samples: {len(train_dataset)}")
         print(f"   Test samples: {len(test_dataset)}")
@@ -142,10 +245,13 @@ def run_medmnist_verification(output_dir: Path) -> dict:
             'num_classes': len(train_dataset.info['label'])
         }
 
+    except ImportError as e:
+        logger.error(f"MedMNIST package not installed: {e}")
+        logger.error("Please install medmnist: uv add medmnist")
+        raise
     except Exception as e:
         logger.error(f"Failed to load MedMNIST: {e}")
-        logger.info("Falling back to synthetic verification")
-        return run_synthetic_verification(output_dir)
+        raise
 
     # Load pre-trained ViT model
     print("\n[2/5] Loading Vision Transformer model...")
@@ -170,10 +276,25 @@ def run_medmnist_verification(output_dir: Path) -> dict:
 
     except Exception as e:
         logger.error(f"Failed to load model: {e}")
-        return run_synthetic_verification(output_dir)
+        raise
 
-    # Test initial accuracy
-    print("\n[3/5] Testing initial model performance...")
+    # Fine-tune model on PathMNIST
+    print("\n[3/7] Fine-tuning model on PathMNIST...")
+    print("   (This is essential for AlphaEdit - model must learn task-specific features)")
+
+    finetune_metrics = finetune_model(
+        model=model,
+        train_loader=train_loader,
+        device=device,
+        num_epochs=3,
+        lr=1e-4,
+        verbose=True
+    )
+
+    results['finetuning'] = finetune_metrics
+
+    # Test accuracy after fine-tuning
+    print("\n[4/7] Testing model performance after fine-tuning...")
     correct = 0
     total = 0
     misclassified_samples = []
@@ -202,10 +323,10 @@ def run_medmnist_verification(output_dir: Path) -> dict:
             total += len(labels)
 
     initial_accuracy = correct / total
-    print(f"   Initial accuracy: {initial_accuracy:.2%}")
+    print(f"   Post-finetuning accuracy: {initial_accuracy:.2%}")
     print(f"   Misclassified samples found: {len(misclassified_samples)}")
 
-    results['initial_performance'] = {
+    results['post_finetuning_performance'] = {
         'accuracy': initial_accuracy,
         'correct': correct,
         'total': total,
@@ -213,7 +334,7 @@ def run_medmnist_verification(output_dir: Path) -> dict:
     }
 
     # Demonstrate causal tracing on a sample
-    print("\n[4/5] Demonstrating causal tracing on misclassified sample...")
+    print("\n[5/7] Demonstrating causal tracing on misclassified sample...")
 
     if len(misclassified_samples) > 0:
         from src.causal_tracing import CausalTracer
@@ -267,53 +388,145 @@ def run_medmnist_verification(output_dir: Path) -> dict:
 
         tracer.cleanup()
 
-    # Demonstrate null-space projection
-    print("\n[5/5] Demonstrating null-space projection...")
+    # Demonstrate null-space projection with fc1 activations
+    print("\n[6/7] Demonstrating null-space projection with fc1 activations...")
     from src.null_space_projection import NullSpaceProjector
+    from src.medical_alphaedit import MedicalAlphaEdit
 
     projector = NullSpaceProjector()
+    target_layer = 10  # Layer to edit (typically later layers)
 
-    # Collect correct activations
-    print("   Collecting correct activations...")
-    correct_activations = []
+    # Collect fc1 activations using hook (CRITICAL FIX)
+    print("   Collecting fc1 activations from correctly classified samples...")
+    fc1_activations_by_class: Dict[int, List[np.ndarray]] = {}
+    hook_storage = {}
 
-    with torch.no_grad():
-        for batch_idx, (images, labels) in enumerate(train_loader):
-            if batch_idx >= 5:  # Limit for demo
-                break
+    # Register hook on target layer's fc1
+    fc1_module = model.blocks[target_layer].mlp.fc1
 
-            images = images.to(device)
-            labels = labels.squeeze().to(device)
+    def capture_fc1(module, inp, out):
+        hook_storage['fc1'] = out.detach()
 
-            outputs = model(images)
-            predictions = outputs.argmax(dim=1)
+    hook = fc1_module.register_forward_hook(capture_fc1)
 
-            for i in range(len(labels)):
-                if predictions[i] == labels[i]:
-                    correct_activations.append(outputs[i].cpu().numpy())
+    try:
+        with torch.no_grad():
+            for batch_idx, (images, labels) in enumerate(train_loader):
+                if batch_idx >= 10:  # Collect from more batches
+                    break
 
-            if len(correct_activations) >= 100:
-                break
+                images = images.to(device)
+                labels = labels.squeeze()
 
-    print(f"   Collected {len(correct_activations)} correct activations")
+                outputs = model(images)
+                predictions = outputs.argmax(dim=1).cpu()
 
-    if len(correct_activations) > 10:
-        K_0 = np.array(correct_activations).T  # [feature_dim x num_samples]
-        print(f"   Activation matrix shape: {K_0.shape}")
+                # fc1_out shape: [batch, num_patches, fc1_dim]
+                fc1_out = hook_storage['fc1'].cpu().numpy()
+                # CLS token activation: [batch, fc1_dim]
+                cls_activations = fc1_out[:, 0, :]
 
-        # Compute null-space projection
-        proj_result = projector.compute_null_space_projection(K_0, verbose=False)
+                for i in range(len(labels)):
+                    label = int(labels[i].item())
+                    if predictions[i] == label:  # Correctly classified
+                        if label not in fc1_activations_by_class:
+                            fc1_activations_by_class[label] = []
+                        if len(fc1_activations_by_class[label]) < 50:
+                            fc1_activations_by_class[label].append(cls_activations[i])
+    finally:
+        hook.remove()
 
-        print(f"   Null space dimension: {proj_result.null_space_dim}")
-        print(f"   Covariance rank: {proj_result.rank}")
+    # Report collection results
+    total_collected = sum(len(v) for v in fc1_activations_by_class.values())
+    print(f"   Collected {total_collected} fc1 activations across {len(fc1_activations_by_class)} classes")
 
-        results['null_space'] = {
-            'num_correct_samples': len(correct_activations),
-            'feature_dim': K_0.shape[0],
-            'null_space_dim': proj_result.null_space_dim,
-            'rank': proj_result.rank,
-            'condition_number': proj_result.condition_number
-        }
+    # Compute null-space for each class with enough samples
+    null_space_results = {}
+    for class_id, activations in fc1_activations_by_class.items():
+        if len(activations) >= 10:
+            K_0 = np.array(activations).T  # [fc1_dim x num_samples]
+            proj_result = projector.compute_null_space_projection(K_0, verbose=False)
+            null_space_results[class_id] = {
+                'num_samples': len(activations),
+                'fc1_dim': K_0.shape[0],
+                'null_space_dim': proj_result.null_space_dim,
+                'rank': proj_result.rank
+            }
+            print(f"   Class {class_id}: {len(activations)} samples, "
+                  f"fc1_dim={K_0.shape[0]}, null_dim={proj_result.null_space_dim}")
+
+    results['null_space'] = {
+        'target_layer': target_layer,
+        'classes_analyzed': len(null_space_results),
+        'total_samples': total_collected,
+        'class_results': null_space_results
+    }
+
+    # Demonstrate actual error correction
+    print("\n[7/7] Demonstrating error correction...")
+
+    if len(misclassified_samples) > 0 and len(fc1_activations_by_class) > 0:
+        # Initialize MedicalAlphaEdit framework
+        editor = MedicalAlphaEdit(model=model, device=device, target_layer=target_layer)
+
+        # Manually set reference activations (already collected)
+        for class_id, activations in fc1_activations_by_class.items():
+            if len(activations) >= 5:
+                editor.reference_activations[class_id] = np.array(activations).T
+
+        # Find a misclassified sample whose target class has reference activations
+        correction_attempted = False
+        for sample_info in misclassified_samples[:20]:  # Try up to 20 samples
+            target_class = sample_info['true_label']
+
+            if target_class in editor.reference_activations:
+                # Reload the sample
+                sample_image = None
+                for batch_idx, (images, labels) in enumerate(test_loader):
+                    if batch_idx == sample_info['batch_idx']:
+                        sample_image = images[sample_info['sample_idx']].unsqueeze(0).to(device)
+                        break
+
+                if sample_image is None:
+                    continue
+
+                print(f"   Attempting to correct: pred={sample_info['predicted']} -> target={target_class}")
+
+                # Get null-space projection info
+                proj_result = editor.get_projection_matrix(target_class, verbose=False)
+                if proj_result:
+                    print(f"   Null space dimension for class {target_class}: {proj_result.null_space_dim}")
+
+                    # Perform correction (without full causal tracing for speed)
+                    try:
+                        correction_result = editor.correct_error(
+                            image=sample_image,
+                            target_label=target_class,
+                            verbose=True,
+                            use_causal_tracing=False
+                        )
+
+                        results['correction'] = {
+                            'success': correction_result.success,
+                            'original_prediction': int(correction_result.original_prediction.argmax()),
+                            'corrected_prediction': int(correction_result.corrected_prediction.argmax()),
+                            'target_label': target_class,
+                            'num_edits': correction_result.num_edits,
+                            'total_weight_change': float(correction_result.total_weight_change),
+                            'null_space_dim': proj_result.null_space_dim,
+                            'preservation_metrics': correction_result.preservation_metrics
+                        }
+
+                        print(f"   Correction {'SUCCESS' if correction_result.success else 'FAILED'}")
+                        correction_attempted = True
+                        break
+                    except Exception as e:
+                        print(f"   Correction failed with error: {e}")
+                        continue
+
+        if not correction_attempted:
+            print(f"   Could not find suitable sample for correction demo")
+            print(f"   Available classes in reference: {list(editor.reference_activations.keys())}")
 
     return results
 
