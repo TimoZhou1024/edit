@@ -17,10 +17,14 @@ import argparse
 import sys
 import json
 import logging
+import csv
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
+import torch
 import numpy as np
+import pandas as pd
+from sklearn.metrics import confusion_matrix
 
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent))
@@ -39,6 +43,83 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+
+def evaluate_model_detailed(
+    model,
+    loader,
+    device: str,
+    output_dir: Path,
+    prefix: str = "eval",
+    num_batches: int = 10
+) -> Dict:
+    """
+    Detailed model evaluation with tables output.
+
+    Generates:
+    1. Predictions table (Sample Index, True Label, Predicted Label)
+    2. Confusion Matrix
+    """
+    model.eval()
+    all_preds = []
+    all_labels = []
+    
+    # Store detailed predictions
+    # Format: {'batch_idx': int, 'sample_idx': int, 'true': int, 'pred': int}
+    detailed_preds = []
+
+    print(f"   Running detailed evaluation ({prefix})...")
+    
+    with torch.no_grad():
+        total_batches = 0
+        global_idx = 0
+        for batch_idx, (images, labels) in enumerate(loader):
+            if batch_idx >= num_batches:
+                break
+            
+            images = images.to(device)
+            labels = labels.squeeze().to(device)
+            
+            outputs = model(images)
+            predictions = outputs.argmax(dim=1)
+            
+            all_preds.extend(predictions.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+            
+            for i in range(len(labels)):
+                detailed_preds.append({
+                    'global_index': global_idx,
+                    'batch_index': batch_idx,
+                    'in_batch_index': i,
+                    'true_label': int(labels[i].item()),
+                    'predicted_label': int(predictions[i].item())
+                })
+                global_idx += 1
+            
+            total_batches += 1
+
+    # Calculate metrics
+    accuracy = np.mean(np.array(all_preds) == np.array(all_labels))
+    cm = confusion_matrix(all_labels, all_preds)
+
+    # Save Prediction Table
+    pred_df = pd.DataFrame(detailed_preds)
+    pred_path = output_dir / f"{prefix}_predictions.csv"
+    pred_df.to_csv(pred_path, index=False)
+    print(f"   Saved predictions table to {pred_path}")
+
+    # Save Confusion Matrix
+    cm_df = pd.DataFrame(cm)
+    cm_path = output_dir / f"{prefix}_confusion_matrix.csv"
+    cm_df.to_csv(cm_path, index=False)
+    print(f"   Saved confusion matrix to {cm_path}")
+    
+    return {
+        'accuracy': accuracy,
+        'predictions_path': str(pred_path),
+        'confusion_matrix_path': str(cm_path),
+        'confusion_matrix': cm.tolist()
+    }
 
 
 def run_synthetic_verification(output_dir: Path) -> dict:
@@ -241,8 +322,8 @@ def run_medmnist_verification(
         ])
 
         # Load train and test sets
-        train_dataset = PathMNIST(split='train', transform=transform, download=True, size=224)
-        test_dataset = PathMNIST(split='test', transform=transform, download=True, size=224)
+        train_dataset = PathMNIST(split='train', transform=transform, download=False, size=224, mmap_mode='r')
+        test_dataset = PathMNIST(split='test', transform=transform, download=False, size=224, mmap_mode='r')
 
         # Use smaller batch size to avoid memory issues
         train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True)
@@ -630,6 +711,7 @@ def run_medmnist_verification(
                 if proj_result:
                     print(f"   Null space dimension for class {target_class}: {proj_result.null_space_dim}")
 
+
                     # ═══════════════════════════════════════════════════════════
                     # Method 1: MLP Editing (using Causal Tracing target layer)
                     # ═══════════════════════════════════════════════════════════
@@ -637,6 +719,13 @@ def run_medmnist_verification(
 
                     # Save original weights for restoration
                     original_fc2_weight = model.blocks[target_layer].mlp.fc2.weight.data.clone()
+                    
+                    # [EVAL] Pre-Edit Detailed Evaluation
+                    print("\n   [Pre-Edit Evaluation]")
+                    pre_edit_eval = evaluate_model_detailed(
+                        model, test_loader, device, output_dir, prefix="pre_edit_mlp"
+                    )
+                    print(f"   Pre-Edit Accuracy: {pre_edit_eval['accuracy']:.2%}")
 
                     try:
                         mlp_result = editor.correct_error(
@@ -652,8 +741,36 @@ def run_medmnist_verification(
 
                         print(f"   MLP Editing: {'SUCCESS' if mlp_success else 'FAILED'}")
                         print(f"   Weight change: {mlp_weight_change:.6f}")
+                        
+                        # [EVAL] Post-Edit Detailed Evaluation (Independent Test Set)
+                        print("\n   [Post-Edit Evaluation] Measuring effect on independent test set (unseen data)...")
+                        post_edit_eval = evaluate_model_detailed(
+                            model, test_loader, device, output_dir, prefix="post_edit_mlp"
+                        )
+                        test_acc = post_edit_eval['accuracy']
+                        
+                        print(f"   Independent Test Set Accuracy (Post-Edit): {test_acc:.2%}")
+                        print(f"   (Compare to initial accuracy: {initial_accuracy:.2%})")
+                        
+                        # Check for ANY changes
+                        df_pre = pd.read_csv(pre_edit_eval['predictions_path'])
+                        df_post = pd.read_csv(post_edit_eval['predictions_path'])
+                        changes = df_pre['predicted_label'] != df_post['predicted_label']
+                        num_changes = changes.sum()
+                        print(f"   Number of predictions changed in test set: {num_changes} / {len(df_pre)}")
+                        
+                        if num_changes > 0:
+                            print("   Changed samples details:")
+                            changed_indices = df_pre[changes].index
+                            for idx in changed_indices[:5]: # Show first 5
+                                print(f"     Idx {idx}: True={df_pre.iloc[idx]['true_label']}, "
+                                      f"Pre={df_pre.iloc[idx]['predicted_label']} -> Post={df_post.iloc[idx]['predicted_label']}")
+                        else:
+                            print("   No prediction changes detected (Edit specificity is extremely high or update too weak).")
 
                     except Exception as e:
+                        import traceback
+                        traceback.print_exc()
                         print(f"   MLP Editing failed: {e}")
                         mlp_success = False
                         mlp_weight_change = 0
@@ -695,79 +812,82 @@ def run_medmnist_verification(
                     # ═══════════════════════════════════════════════════════════
                     # Method 1b: Null-space Direct (end-to-end with preservation)
                     # ═══════════════════════════════════════════════════════════
-                    print(f"   --- Method 1b: Null-space Direct (Layer {target_layer}) ---")
+                    # DISABLED: User requested strictly closed-form methods.
+                    # This method uses gradient descent on weights, so it is excluded.
+                    # print(f"   --- Method 1b: Null-space Direct (Layer {target_layer}) ---")
 
                     # Restore head weights first
-                    model.head.weight.data = original_head_weight
+                    # model.head.weight.data = original_head_weight
                     # Restore fc2 weights
-                    model.blocks[target_layer].mlp.fc2.weight.data = original_fc2_weight
+                    # model.blocks[target_layer].mlp.fc2.weight.data = original_fc2_weight
 
-                    try:
-                        nullspace_direct_result = editor.correct_error_nullspace_direct(
-                            image=sample_image,
-                            target_label=target_class,
-                            num_steps=100,
-                            lr=0.05,
-                            l2_weight=0.0001,
-                            nullspace_weight=0.1,  # Soft constraint
-                            verbose=True
-                        )
+                    # try:
+                    #     nullspace_direct_result = editor.correct_error_nullspace_direct(
+                    #         image=sample_image,
+                    #         target_label=target_class,
+                    #         num_steps=100,
+                    #         lr=0.05,
+                    #         l2_weight=0.0001,
+                    #         nullspace_weight=0.1,  # Soft constraint
+                    #         verbose=True
+                    #     )
 
-                        nullspace_direct_success = nullspace_direct_result.success
-                        nullspace_direct_weight_change = nullspace_direct_result.total_weight_change
-                        nullspace_direct_pres_error = nullspace_direct_result.preservation_metrics.get('preservation_error', 0)
+                    #     nullspace_direct_success = nullspace_direct_result.success
+                    #     nullspace_direct_weight_change = nullspace_direct_result.total_weight_change
+                    #     nullspace_direct_pres_error = nullspace_direct_result.preservation_metrics.get('preservation_error', 0)
 
-                        print(f"   Null-space Direct: {'SUCCESS' if nullspace_direct_success else 'FAILED'}")
-                        print(f"   Weight change: {nullspace_direct_weight_change:.6f}")
-                        print(f"   Preservation error: {nullspace_direct_pres_error:.6f}")
+                    #     print(f"   Null-space Direct: {'SUCCESS' if nullspace_direct_success else 'FAILED'}")
+                    #     print(f"   Weight change: {nullspace_direct_weight_change:.6f}")
+                    #     print(f"   Preservation error: {nullspace_direct_pres_error:.6f}")
 
-                    except Exception as e:
-                        print(f"   Null-space Direct failed: {e}")
-                        import traceback
-                        traceback.print_exc()
-                        nullspace_direct_success = False
+                    # except Exception as e:
+                    #     print(f"   Null-space Direct failed: {e}")
+                    #     import traceback
+                    #     traceback.print_exc()
+                    #     nullspace_direct_success = False
                         nullspace_direct_weight_change = 0
                         nullspace_direct_pres_error = 0
 
                     # ═══════════════════════════════════════════════════════════
                     # Method 3: Direct MLP Optimization (end-to-end)
                     # ═══════════════════════════════════════════════════════════
-                    print(f"   --- Method 3: Direct MLP Optimization (Layer {target_layer}) ---")
+                    # DISABLED: Gradient descent based method.
+                    # print(f"   --- Method 3: Direct MLP Optimization (Layer {target_layer}) ---")
 
                     # Restore head weights first
-                    model.head.weight.data = original_head_weight
+                    # model.head.weight.data = original_head_weight
                     # Restore fc2 weights
-                    model.blocks[target_layer].mlp.fc2.weight.data = original_fc2_weight
+                    # model.blocks[target_layer].mlp.fc2.weight.data = original_fc2_weight
 
-                    try:
-                        direct_result = editor.correct_error_direct(
-                            image=sample_image,
-                            target_label=target_class,
-                            num_steps=50,
-                            lr=0.01,
-                            verbose=True
-                        )
+                    # try:
+                    #     direct_result = editor.correct_error_direct(
+                    #         image=sample_image,
+                    #         target_label=target_class,
+                    #         num_steps=50,
+                    #         lr=0.01,
+                    #         verbose=True
+                    #     )
 
-                        direct_success = direct_result.success
-                        direct_weight_change = direct_result.total_weight_change
+                    #     direct_success = direct_result.success
+                    #     direct_weight_change = direct_result.total_weight_change
 
-                        print(f"   Direct MLP: {'SUCCESS' if direct_success else 'FAILED'}")
-                        print(f"   Weight change: {direct_weight_change:.6f}")
+                    #     print(f"   Direct MLP: {'SUCCESS' if direct_success else 'FAILED'}")
+                    #     print(f"   Weight change: {direct_weight_change:.6f}")
 
-                    except Exception as e:
-                        print(f"   Direct MLP Optimization failed: {e}")
-                        import traceback
-                        traceback.print_exc()
-                        direct_success = False
-                        direct_weight_change = 0
+                    # except Exception as e:
+                    #     print(f"   Direct MLP Optimization failed: {e}")
+                    #     import traceback
+                    #     traceback.print_exc()
+                    #     direct_success = False
+                    #     direct_weight_change = 0
 
                     # ═══════════════════════════════════════════════════════════
                     # Comparison Summary
                     # ═══════════════════════════════════════════════════════════
                     print("\n   === Correction Method Comparison ===")
-                    print(f"   MLP Editing (v* + null-space):     {'[SUCCESS]' if mlp_success else '[FAILED]'}")
-                    print(f"   Null-space Direct (end-to-end):    {'[SUCCESS]' if nullspace_direct_success else '[FAILED]'}")
-                    print(f"   Direct MLP Optimization:           {'[SUCCESS]' if direct_success else '[FAILED]'}")
+                    print(f"   MLP Editing (AlphaEdit Closed-Form):     {'[SUCCESS]' if mlp_success else '[FAILED]'}")
+                    # print(f"   Null-space Direct (end-to-end):    {'[SUCCESS]' if nullspace_direct_success else '[FAILED]'}")
+                    # print(f"   Direct MLP Optimization:           {'[SUCCESS]' if direct_success else '[FAILED]'}")
                     print(f"   Head Editing:                      {'[SUCCESS]' if head_success else '[FAILED]'}")
 
                     results['correction'] = {
@@ -777,15 +897,15 @@ def run_medmnist_verification(
                             'weight_change': float(mlp_weight_change),
                             'preservation_error': mlp_preservation if isinstance(mlp_preservation, str) else float(mlp_preservation)
                         },
-                        'nullspace_direct': {
-                            'success': nullspace_direct_success,
-                            'weight_change': float(nullspace_direct_weight_change),
-                            'preservation_error': float(nullspace_direct_pres_error)
-                        },
-                        'direct_mlp_optimization': {
-                            'success': direct_success,
-                            'weight_change': float(direct_weight_change)
-                        },
+                        # 'nullspace_direct': {
+                        #     'success': nullspace_direct_success,
+                        #     'weight_change': float(nullspace_direct_weight_change),
+                        #     'preservation_error': float(nullspace_direct_pres_error)
+                        # },
+                        # 'direct_mlp_optimization': {
+                        #     'success': direct_success,
+                        #     'weight_change': float(direct_weight_change)
+                        # },
                         'head_editing': {
                             'success': head_success,
                             'weight_change': float(head_weight_change)

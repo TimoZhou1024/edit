@@ -16,6 +16,7 @@ dependencies = [
     "medmnist>=2.2.0",
     "pillow>=9.5.0",
     "scikit-learn>=1.2.0",
+    "pandas>=2.3.3",
 ]
 
 [build-system]
