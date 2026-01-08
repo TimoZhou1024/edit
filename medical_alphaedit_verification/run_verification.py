@@ -443,6 +443,13 @@ def run_medmnist_verification(
                     score = fault_result.msa_fault_scores[patch_idx, layer_idx]
                 print(f"      {rank}. Patch {patch_idx}, Layer {layer_idx}, {component_type.upper()}: score = {score:.4f}")
 
+            # Extract the most critical layer for editing (from MLP components)
+            mlp_components = [(p, layer, t) for p, layer, t in critical_components if t == 'mlp']
+            if mlp_components:
+                critical_layer = mlp_components[0][1]  # Layer index from top MLP component
+            else:
+                critical_layer = critical_components[0][1] if critical_components else 11
+
             results['causal_tracing'] = {
                 'method': 'real_corrupt_restore',
                 'sample_true_label': sample_label,
@@ -454,7 +461,8 @@ def run_medmnist_verification(
                     {'patch': patch, 'layer': layer, 'type': comp_type}
                     for patch, layer, comp_type in critical_components[:5]
                 ],
-                'top_components': [(patch, layer) for patch, layer, _ in critical_components[:5]]
+                'top_components': [(patch, layer) for patch, layer, _ in critical_components[:5]],
+                'critical_layer_for_editing': critical_layer
             }
 
         else:
@@ -478,16 +486,30 @@ def run_medmnist_verification(
                 score = fault_scores[patch_idx, layer_idx]
                 print(f"      {rank}. Patch {patch_idx}, Layer {layer_idx}: score = {score:.4f}")
 
+            # Extract critical layer from simulated results
+            critical_layer = top_5_indices[0] % num_layers
+
             results['causal_tracing'] = {
                 'method': 'simulated',
                 'sample_true_label': sample_label,
                 'sample_predicted': sample_info['predicted'],
                 'num_patches_analyzed': num_patches,
                 'num_layers_analyzed': num_layers,
-                'top_components': [(idx // num_layers, idx % num_layers) for idx in top_5_indices]
+                'top_components': [(idx // num_layers, idx % num_layers) for idx in top_5_indices],
+                'critical_layer_for_editing': critical_layer
             }
 
         tracer.cleanup()
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # Use Causal Tracing result to determine target layer for editing
+    # ═══════════════════════════════════════════════════════════════════════
+    if 'causal_tracing' in results and 'critical_layer_for_editing' in results['causal_tracing']:
+        target_layer = results['causal_tracing']['critical_layer_for_editing']
+        print(f"\n   *** Using Causal Tracing result: editing Layer {target_layer} ***")
+    else:
+        target_layer = 11  # Default to last layer
+        print(f"\n   *** No Causal Tracing result, using default Layer {target_layer} ***")
 
     # Demonstrate null-space projection with fc1 activations
     print("\n[6/7] Demonstrating null-space projection with fc1 activations...")
@@ -495,7 +517,7 @@ def run_medmnist_verification(
     from src.medical_alphaedit import MedicalAlphaEdit
 
     projector = NullSpaceProjector()
-    target_layer = 10  # Layer to edit (typically later layers)
+    # target_layer is now determined by Causal Tracing above
 
     # Collect fc1 activations using hook (CRITICAL FIX)
     print("   Collecting fc1 activations from correctly classified samples...")
@@ -565,9 +587,10 @@ def run_medmnist_verification(
 
     # Demonstrate actual error correction
     print("\n[7/7] Demonstrating error correction...")
+    print(f"   Target layer for MLP editing: {target_layer} (from Causal Tracing)")
 
     if len(misclassified_samples) > 0 and len(fc1_activations_by_class) > 0:
-        # Initialize MedicalAlphaEdit framework
+        # Initialize MedicalAlphaEdit framework with layer from Causal Tracing
         editor = MedicalAlphaEdit(model=model, device=device, target_layer=target_layer)
 
         # Manually set reference activations (already collected)
@@ -591,39 +614,181 @@ def run_medmnist_verification(
                 if sample_image is None:
                     continue
 
-                print(f"   Attempting to correct: pred={sample_info['predicted']} -> target={target_class}")
+                print(f"\n   Attempting to correct: pred={sample_info['predicted']} -> target={target_class}")
 
                 # Get null-space projection info
                 proj_result = editor.get_projection_matrix(target_class, verbose=False)
                 if proj_result:
                     print(f"   Null space dimension for class {target_class}: {proj_result.null_space_dim}")
 
-                    # Perform correction (without full causal tracing for speed)
+                    # ═══════════════════════════════════════════════════════════
+                    # Method 1: MLP Editing (using Causal Tracing target layer)
+                    # ═══════════════════════════════════════════════════════════
+                    print(f"\n   --- Method 1: MLP Editing (Layer {target_layer}) ---")
+
+                    # Save original weights for restoration
+                    original_fc2_weight = model.blocks[target_layer].mlp.fc2.weight.data.clone()
+
                     try:
-                        correction_result = editor.correct_error(
+                        mlp_result = editor.correct_error(
                             image=sample_image,
                             target_label=target_class,
                             verbose=True,
-                            use_causal_tracing=False
+                            use_causal_tracing=False  # Already did causal tracing
                         )
 
-                        results['correction'] = {
-                            'success': correction_result.success,
-                            'original_prediction': int(correction_result.original_prediction.argmax()),
-                            'corrected_prediction': int(correction_result.corrected_prediction.argmax()),
-                            'target_label': target_class,
-                            'num_edits': correction_result.num_edits,
-                            'total_weight_change': float(correction_result.total_weight_change),
-                            'null_space_dim': proj_result.null_space_dim,
-                            'preservation_metrics': correction_result.preservation_metrics
-                        }
+                        mlp_success = mlp_result.success
+                        mlp_weight_change = mlp_result.total_weight_change
+                        mlp_preservation = mlp_result.preservation_metrics.get('avg_preservation_error', 'N/A')
 
-                        print(f"   Correction {'SUCCESS' if correction_result.success else 'FAILED'}")
-                        correction_attempted = True
-                        break
+                        print(f"   MLP Editing: {'SUCCESS' if mlp_success else 'FAILED'}")
+                        print(f"   Weight change: {mlp_weight_change:.6f}")
+
                     except Exception as e:
-                        print(f"   Correction failed with error: {e}")
-                        continue
+                        print(f"   MLP Editing failed: {e}")
+                        mlp_success = False
+                        mlp_weight_change = 0
+                        mlp_preservation = 'error'
+
+                    # Restore original weights for fair comparison
+                    model.blocks[target_layer].mlp.fc2.weight.data = original_fc2_weight
+
+                    # ═══════════════════════════════════════════════════════════
+                    # Method 2: Head Editing (direct classification head)
+                    # ═══════════════════════════════════════════════════════════
+                    print("   --- Method 2: Head Editing (Classification Head) ---")
+
+                    # Save original head weights for potential restoration
+                    original_head_weight = model.head.weight.data.clone()
+
+                    try:
+                        head_result = editor.correct_error_head(
+                            image=sample_image,
+                            target_label=target_class,
+                            verbose=True
+                        )
+
+                        head_success = head_result.success
+                        head_weight_change = head_result.total_weight_change
+
+                        print(f"   Head Editing: {'SUCCESS' if head_success else 'FAILED'}")
+                        print(f"   Weight change: {head_weight_change:.6f}")
+
+                    except Exception as e:
+                        print(f"   Head Editing failed: {e}")
+                        head_success = False
+                        head_weight_change = 0
+
+                    # Restore head weights if needed for subsequent tests
+                    if not head_success:
+                        model.head.weight.data = original_head_weight
+
+                    # ═══════════════════════════════════════════════════════════
+                    # Method 1b: Null-space Direct (end-to-end with preservation)
+                    # ═══════════════════════════════════════════════════════════
+                    print(f"   --- Method 1b: Null-space Direct (Layer {target_layer}) ---")
+
+                    # Restore head weights first
+                    model.head.weight.data = original_head_weight
+                    # Restore fc2 weights
+                    model.blocks[target_layer].mlp.fc2.weight.data = original_fc2_weight
+
+                    try:
+                        nullspace_direct_result = editor.correct_error_nullspace_direct(
+                            image=sample_image,
+                            target_label=target_class,
+                            num_steps=100,
+                            lr=0.05,
+                            l2_weight=0.0001,
+                            nullspace_weight=0.1,  # Soft constraint
+                            verbose=True
+                        )
+
+                        nullspace_direct_success = nullspace_direct_result.success
+                        nullspace_direct_weight_change = nullspace_direct_result.total_weight_change
+                        nullspace_direct_pres_error = nullspace_direct_result.preservation_metrics.get('preservation_error', 0)
+
+                        print(f"   Null-space Direct: {'SUCCESS' if nullspace_direct_success else 'FAILED'}")
+                        print(f"   Weight change: {nullspace_direct_weight_change:.6f}")
+                        print(f"   Preservation error: {nullspace_direct_pres_error:.6f}")
+
+                    except Exception as e:
+                        print(f"   Null-space Direct failed: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        nullspace_direct_success = False
+                        nullspace_direct_weight_change = 0
+                        nullspace_direct_pres_error = 0
+
+                    # ═══════════════════════════════════════════════════════════
+                    # Method 3: Direct MLP Optimization (end-to-end)
+                    # ═══════════════════════════════════════════════════════════
+                    print(f"   --- Method 3: Direct MLP Optimization (Layer {target_layer}) ---")
+
+                    # Restore head weights first
+                    model.head.weight.data = original_head_weight
+                    # Restore fc2 weights
+                    model.blocks[target_layer].mlp.fc2.weight.data = original_fc2_weight
+
+                    try:
+                        direct_result = editor.correct_error_direct(
+                            image=sample_image,
+                            target_label=target_class,
+                            num_steps=50,
+                            lr=0.01,
+                            verbose=True
+                        )
+
+                        direct_success = direct_result.success
+                        direct_weight_change = direct_result.total_weight_change
+
+                        print(f"   Direct MLP: {'SUCCESS' if direct_success else 'FAILED'}")
+                        print(f"   Weight change: {direct_weight_change:.6f}")
+
+                    except Exception as e:
+                        print(f"   Direct MLP Optimization failed: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        direct_success = False
+                        direct_weight_change = 0
+
+                    # ═══════════════════════════════════════════════════════════
+                    # Comparison Summary
+                    # ═══════════════════════════════════════════════════════════
+                    print("\n   === Correction Method Comparison ===")
+                    print(f"   MLP Editing (v* + null-space):     {'[SUCCESS]' if mlp_success else '[FAILED]'}")
+                    print(f"   Null-space Direct (end-to-end):    {'[SUCCESS]' if nullspace_direct_success else '[FAILED]'}")
+                    print(f"   Direct MLP Optimization:           {'[SUCCESS]' if direct_success else '[FAILED]'}")
+                    print(f"   Head Editing:                      {'[SUCCESS]' if head_success else '[FAILED]'}")
+
+                    results['correction'] = {
+                        'target_layer_from_causal_tracing': target_layer,
+                        'mlp_editing': {
+                            'success': mlp_success,
+                            'weight_change': float(mlp_weight_change),
+                            'preservation_error': mlp_preservation if isinstance(mlp_preservation, str) else float(mlp_preservation)
+                        },
+                        'nullspace_direct': {
+                            'success': nullspace_direct_success,
+                            'weight_change': float(nullspace_direct_weight_change),
+                            'preservation_error': float(nullspace_direct_pres_error)
+                        },
+                        'direct_mlp_optimization': {
+                            'success': direct_success,
+                            'weight_change': float(direct_weight_change)
+                        },
+                        'head_editing': {
+                            'success': head_success,
+                            'weight_change': float(head_weight_change)
+                        },
+                        'original_prediction': sample_info['predicted'],
+                        'target_label': target_class,
+                        'null_space_dim': proj_result.null_space_dim,
+                        'causal_tracing_guided': True
+                    }
+
+                    correction_attempted = True
+                    break
 
         if not correction_attempted:
             print(f"   Could not find suitable sample for correction demo")

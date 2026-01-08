@@ -1,0 +1,17 @@
+medical_alphaedit_verification/outputs/
+medical_alphaedit_verification/checkpoints/
+
+
+# latex
+*.aux
+*.bbl
+*.blg
+*.log
+*.out
+*.toc
+*.fls
+*.synctex.gz
+
+*.pyc
+*.pkl
+

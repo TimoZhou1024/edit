@@ -70,7 +70,7 @@ class MedicalAlphaEdit:
         regularization: float = 1e-6,
         max_edits: int = 10,
         convergence_threshold: float = 0.01,
-        target_layer: int = 10
+        target_layer: int = 11  # Changed to last layer (11 for ViT-B/16)
     ):
         """
         Initialize the Medical AlphaEdit framework.
@@ -255,30 +255,43 @@ class MedicalAlphaEdit:
         self,
         k_star: np.ndarray,
         target_class: int,
-        method: str = 'nearest'
+        method: str = 'mean',
+        image: Optional[torch.Tensor] = None,
+        verbose: bool = False
     ) -> Optional[np.ndarray]:
         """
         Retrieve target activation v* for error correction.
 
-        v* is the desired fc2 output, computed from the nearest correct activation.
+        v* is the desired fc2 output that would produce the correct prediction.
 
         Args:
             k_star: Faulty fc1 activation [fc1_dim]
             target_class: The correct class label
-            method: 'nearest' for nearest-neighbor, 'gradient' for optimization
+            method: 'nearest' for nearest-neighbor, 'mean' for class mean,
+                    'gradient' for ROME/MEMIT-style optimization (RECOMMENDED)
+            image: Input image tensor (required for 'gradient' method)
+            verbose: Whether to print optimization progress
 
         Returns:
-            Target activation v* [fc2_out_dim] or None
+            Target activation v* [hidden_dim] or None
         """
+        # Get fc2 weight matrix
+        fc2 = self.model.blocks[self.target_layer].mlp.fc2
+        W = fc2.weight.data.cpu().numpy()  # [hidden_dim x fc1_dim]
+
+        if method == 'gradient':
+            # ROME/MEMIT-style gradient optimization (RECOMMENDED)
+            if image is None:
+                logger.error("'gradient' method requires image parameter")
+                return None
+            return self._optimize_target_activation(image, target_class, verbose=verbose)
+
+        # For non-gradient methods, check reference activations
         if target_class not in self.reference_activations:
             logger.warning(f"No reference activations for class {target_class}")
             return None
 
         K_0 = self.reference_activations[target_class]  # [fc1_dim x num_samples]
-
-        # Get fc2 weight matrix
-        fc2 = self.model.blocks[self.target_layer].mlp.fc2
-        W = fc2.weight.data.cpu().numpy()  # [fc2_out_dim x fc1_dim]
 
         if method == 'nearest':
             # Find nearest neighbor in activation space
@@ -291,58 +304,153 @@ class MedicalAlphaEdit:
             v_star = W @ k_nearest
             return v_star
 
-        elif method == 'gradient':
-            return self._optimize_target_activation(k_star, W, target_class)
+        elif method == 'mean':
+            # Use mean of correct activations - less effective than gradient
+            k_mean = K_0.mean(axis=1)  # [fc1_dim]
+            v_star = W @ k_mean
+            return v_star
 
         else:
             raise ValueError(f"Unknown method: {method}")
 
     def _optimize_target_activation(
         self,
-        k_star: np.ndarray,
-        W: np.ndarray,
+        image: torch.Tensor,
         target_class: int,
-        num_steps: int = 100,
-        lr: float = 0.1
+        num_steps: int = 25,
+        lr: float = 0.5,
+        kl_weight: float = 0.0625,
+        verbose: bool = False
     ) -> np.ndarray:
         """
-        Optimize v* to maximize probability of target class using gradient descent.
+        Optimize v* using ROME/MEMIT methodology: gradient descent to maximize
+        P(target_class | image; v + delta).
+
+        This is the standard approach from knowledge editing literature:
+        1. Freeze all model weights
+        2. Capture the original fc2 output at target layer as v
+        3. Optimize delta such that v + delta maximizes target probability
+        4. Return v* = v + delta
+
+        The optimization objective is:
+        min_delta: -log P(o* | s, r; v + delta) + lambda * ||delta||^2
 
         Args:
-            k_star: Faulty activation [fc1_dim]
-            W: Weight matrix [fc2_out_dim x fc1_dim]
-            target_class: Target class label
-            num_steps: Optimization steps
-            lr: Learning rate
+            image: Input image tensor [1, C, H, W]
+            target_class: Target class label to optimize for
+            num_steps: Number of gradient descent steps (typically 20-25)
+            lr: Learning rate for optimization
+            kl_weight: Weight for L2 regularization on delta
+            verbose: Whether to print optimization progress
 
         Returns:
-            Optimized v* [fc2_out_dim]
+            Optimized v* [hidden_dim] that would produce target_class prediction
         """
-        # Initial v* from current W @ k*
-        v_init = W @ k_star
-        v = torch.tensor(v_init, requires_grad=True, dtype=torch.float32, device='cpu')
-        optimizer = torch.optim.Adam([v], lr=lr)
+        image = image.to(self.device)
+        self.model.train(False)
 
-        # Get classifier head weights
-        head_W = self.model.head.weight.data.cpu()  # [num_classes, hidden_dim]
-        head_b = self.model.head.bias.data.cpu() if self.model.head.bias is not None else None
+        # Storage for activations
+        fc2_output_storage = {}
+        original_fc2_output = None
 
-        target = torch.tensor([target_class], dtype=torch.long)
+        # Get the fc2 module at target layer
+        fc2_module = self.model.blocks[self.target_layer].mlp.fc2
+
+        # Step 1: Capture original fc2 output (v)
+        def capture_fc2_output(module, inp, out):
+            fc2_output_storage['output'] = out
+
+        hook = fc2_module.register_forward_hook(capture_fc2_output)
+        try:
+            with torch.no_grad():
+                original_logits = self.model(image)
+                original_fc2_output = fc2_output_storage['output'].clone()
+                # original_fc2_output shape: [1, num_patches, hidden_dim]
+        finally:
+            hook.remove()
+
+        # Get original CLS token fc2 output: [hidden_dim]
+        v_original = original_fc2_output[0, 0, :].clone()  # CLS token
+
+        if verbose:
+            logger.info(f"  Original fc2 output (v) shape: {v_original.shape}")
+            original_pred = original_logits.argmax().item()
+            logger.info(f"  Original prediction: {original_pred}, Target: {target_class}")
+
+        # Step 2: Initialize delta as trainable parameter
+        delta = torch.zeros_like(v_original, requires_grad=True, device=self.device)
+        optimizer = torch.optim.Adam([delta], lr=lr)
+
+        # Target tensor
+        target_tensor = torch.tensor([target_class], dtype=torch.long, device=self.device)
+
+        # Step 3: Optimization loop
+        best_delta = None
+        best_loss = float('inf')
 
         for step in range(num_steps):
             optimizer.zero_grad()
 
-            # Simulate forward through head
-            if head_b is not None:
-                logits = F.linear(v.unsqueeze(0), head_W, head_b)
-            else:
-                logits = F.linear(v.unsqueeze(0), head_W)
+            # Create intervention hook: replace fc2 output CLS token with v + delta
+            def intervene_fc2(module, inp, out):
+                modified_out = out.clone()
+                # Replace CLS token (position 0) with v + delta
+                modified_out[0, 0, :] = v_original + delta
+                return modified_out
 
-            loss = F.cross_entropy(logits, target)
-            loss.backward()
+            hook = fc2_module.register_forward_hook(intervene_fc2)
+            try:
+                # Forward pass with intervention
+                modified_logits = self.model(image)
+            finally:
+                hook.remove()
+
+            # Compute loss: -log P(target_class)
+            ce_loss = F.cross_entropy(modified_logits, target_tensor)
+
+            # L2 regularization (keeps v* close to v)
+            if kl_weight > 0:
+                l2_loss = kl_weight * torch.sum(delta ** 2)
+                total_loss = ce_loss + l2_loss
+            else:
+                total_loss = ce_loss
+
+            # Backward and optimize
+            total_loss.backward()
             optimizer.step()
 
-        return v.detach().numpy()
+            # Track best result
+            if total_loss.item() < best_loss:
+                best_loss = total_loss.item()
+                best_delta = delta.detach().clone()
+
+            if verbose and (step + 1) % 5 == 0:
+                pred = modified_logits.argmax().item()
+                prob = F.softmax(modified_logits, dim=1)[0, target_class].item()
+                logger.info(f"    Step {step + 1}: loss={total_loss.item():.4f}, "
+                           f"pred={pred}, P(target)={prob:.4f}")
+
+        # Step 4: Compute final v* = v + best_delta
+        v_star = (v_original + best_delta).detach().cpu().numpy()
+
+        if verbose:
+            # Verify final prediction
+            def final_intervene(module, inp, out):
+                modified_out = out.clone()
+                modified_out[0, 0, :] = v_original + best_delta
+                return modified_out
+
+            hook = fc2_module.register_forward_hook(final_intervene)
+            try:
+                with torch.no_grad():
+                    final_logits = self.model(image)
+                    final_pred = final_logits.argmax().item()
+                    final_prob = F.softmax(final_logits, dim=1)[0, target_class].item()
+                    logger.info(f"  Final v* prediction: {final_pred}, P(target)={final_prob:.4f}")
+            finally:
+                hook.remove()
+
+        return v_star
 
     def get_fc1_activation(self, image: torch.Tensor) -> np.ndarray:
         """
@@ -410,6 +518,622 @@ class MedicalAlphaEdit:
         # Apply update
         with torch.no_grad():
             fc2.weight.add_(torch.tensor(delta_W, device=fc2.weight.device, dtype=fc2.weight.dtype))
+
+    def correct_error_direct(
+        self,
+        image: torch.Tensor,
+        target_label: int,
+        num_steps: int = 50,
+        lr: float = 0.1,
+        l2_weight: float = 0.0001,
+        verbose: bool = True
+    ) -> EditingResult:
+        """
+        Direct MLP weight optimization for error correction using hook-based intervention.
+
+        Instead of the two-step process (optimize v* then compute ΔW), this method
+        directly optimizes ΔW end-to-end to maximize P(target_label | image).
+
+        Uses a forward hook to inject the weight perturbation, allowing gradients
+        to flow back to ΔW.
+
+        The optimization is:
+        min_ΔW: -log P(target | x; W + ΔW) + lambda * ||ΔW||^2
+
+        Args:
+            image: Input image that produces error
+            target_label: Correct label for this image
+            num_steps: Number of optimization steps
+            lr: Learning rate
+            l2_weight: Weight for L2 regularization on ΔW
+            verbose: Whether to print progress
+
+        Returns:
+            EditingResult with complete correction information
+        """
+        self.model.train(False)
+        image = image.to(self.device)
+
+        # Get original prediction
+        with torch.no_grad():
+            original_output = self.model(image)
+            original_pred = original_output.cpu().numpy()
+
+        if verbose:
+            logger.info(f"Direct MLP optimization: Original={original_pred.argmax()}, Target={target_label}")
+
+        # Get fc2 module at target layer
+        fc2_module = self.model.blocks[self.target_layer].mlp.fc2
+        fc1_module = self.model.blocks[self.target_layer].mlp.fc1
+
+        # Save original fc2 weight
+        original_weight = fc2_module.weight.data.clone()
+
+        # Initialize ΔW as trainable parameter [hidden_dim x fc1_dim] = [768 x 3072]
+        delta_W = torch.zeros_like(original_weight, requires_grad=True, device=self.device)
+        optimizer = torch.optim.Adam([delta_W], lr=lr)
+
+        # Target tensor
+        target_tensor = torch.tensor([target_label], dtype=torch.long, device=self.device)
+
+        best_delta_W = None
+        best_loss = float('inf')
+
+        for step in range(num_steps):
+            optimizer.zero_grad()
+
+            # Capture fc1 output for manual fc2 computation
+            fc1_storage = {}
+
+            def capture_fc1(module, inp, out):
+                fc1_storage['output'] = out
+
+            hook_fc1 = fc1_module.register_forward_hook(capture_fc1)
+
+            # Hook to modify fc2 output with gradient-enabled perturbation
+            def modify_fc2_output(module, inp, out):
+                # inp[0] is the input to fc2 (i.e., fc1 output after activation)
+                # out = W @ inp + bias
+                # We want: out_new = (W + delta_W) @ inp + bias = out + delta_W @ inp
+                fc1_out = inp[0]  # [batch, num_patches, fc1_dim]
+                # delta_W: [hidden_dim, fc1_dim]
+                # perturbation = fc1_out @ delta_W.T: [batch, num_patches, hidden_dim]
+                perturbation = torch.matmul(fc1_out, delta_W.T)
+                return out + perturbation
+
+            hook_fc2 = fc2_module.register_forward_hook(modify_fc2_output)
+
+            try:
+                # Forward pass with perturbation
+                output = self.model(image)
+
+                # Compute loss
+                ce_loss = F.cross_entropy(output, target_tensor)
+                l2_loss = l2_weight * torch.sum(delta_W ** 2)
+                total_loss = ce_loss + l2_loss
+
+                # Backward - gradients now flow to delta_W through the hook
+                total_loss.backward()
+
+                # Update delta_W
+                optimizer.step()
+
+            finally:
+                hook_fc1.remove()
+                hook_fc2.remove()
+
+            # Track best
+            if total_loss.item() < best_loss:
+                best_loss = total_loss.item()
+                best_delta_W = delta_W.detach().clone()
+
+            if verbose and (step + 1) % 10 == 0:
+                pred = output.argmax().item()
+                prob = F.softmax(output, dim=1)[0, target_label].item()
+                logger.info(f"  Step {step + 1}: loss={total_loss.item():.4f}, "
+                           f"pred={pred}, P(target)={prob:.4f}, ||ΔW||={delta_W.norm().item():.4f}")
+
+            # Early stopping if successful
+            if output.argmax().item() == target_label:
+                best_delta_W = delta_W.detach().clone()
+                if verbose:
+                    logger.info(f"  Correction achieved at step {step + 1}")
+                break
+
+        # Apply best ΔW permanently
+        with torch.no_grad():
+            fc2_module.weight.data = original_weight + best_delta_W
+
+        # Verify final prediction
+        with torch.no_grad():
+            final_output = self.model(image)
+            final_pred = final_output.cpu().numpy()
+
+        success = final_pred.argmax() == target_label
+
+        if verbose:
+            logger.info(f"Direct MLP Edit: {'SUCCESS' if success else 'FAILED'}, "
+                       f"Final={final_pred.argmax()}, ||ΔW||={best_delta_W.norm().item():.4f}")
+
+        return EditingResult(
+            success=success,
+            original_prediction=original_pred,
+            corrected_prediction=final_pred,
+            target_label=target_label,
+            fault_localization=None,
+            weight_updates=[],
+            num_edits=1,
+            total_weight_change=float(best_delta_W.norm().item()),
+            preservation_metrics={
+                'method': 'direct_mlp_optimization',
+                'num_steps': step + 1,
+                'final_loss': best_loss
+            }
+        )
+
+    def correct_error_head(
+        self,
+        image: torch.Tensor,
+        target_label: int,
+        verbose: bool = True
+    ) -> EditingResult:
+        """
+        Alternative error correction by directly editing the classification head.
+
+        This approach directly modifies the final classification layer to correct
+        the prediction for a specific sample. It's more effective than editing
+        intermediate MLP layers because it directly affects the output logits.
+
+        Args:
+            image: Input image that produces error
+            target_label: Correct label for this image
+            verbose: Whether to print progress
+
+        Returns:
+            EditingResult with complete correction information
+        """
+        self.model.train(False)
+        image = image.to(self.device)
+
+        # Get the representation before the head
+        # For timm ViT, we need to hook into forward_head
+        head_input = None
+
+        def capture_head_input(module, inp, out):
+            nonlocal head_input
+            if isinstance(inp, tuple):
+                head_input = inp[0].detach()
+            else:
+                head_input = inp.detach()
+
+        # Hook before the head's linear layer
+        hook = self.model.head.register_forward_hook(capture_head_input)
+
+        try:
+            with torch.no_grad():
+                original_output = self.model(image)
+                original_pred = original_output.cpu().numpy()
+        finally:
+            hook.remove()
+
+        if verbose:
+            logger.info(f"Original prediction: {original_pred.argmax()}, Target: {target_label}")
+
+        if head_input is None:
+            logger.error("Could not capture head input")
+            return EditingResult(
+                success=False,
+                original_prediction=original_pred,
+                corrected_prediction=original_pred,
+                target_label=target_label,
+                fault_localization=None,
+                weight_updates=[],
+                num_edits=0,
+                total_weight_change=0,
+                preservation_metrics={'error': 'head_input_capture_failed'}
+            )
+
+        # Get the feature vector (before classification head)
+        # head_input shape: [1, hidden_dim]
+        h = head_input[0].cpu().numpy()  # [hidden_dim]
+
+        # Get head weights and bias
+        W_head = self.model.head.weight.data.cpu().numpy()  # [num_classes, hidden_dim]
+        b_head = self.model.head.bias.data.cpu().numpy() if self.model.head.bias is not None else None
+
+        if verbose:
+            logger.info(f"  Head input h shape: {h.shape}")
+            logger.info(f"  Head weight W shape: {W_head.shape}")
+
+        # Current logits
+        current_logits = W_head @ h
+        if b_head is not None:
+            current_logits += b_head
+
+        current_pred = current_logits.argmax()
+
+        if current_pred == target_label:
+            if verbose:
+                logger.info("Already correctly predicted!")
+            return EditingResult(
+                success=True,
+                original_prediction=original_pred,
+                corrected_prediction=original_pred,
+                target_label=target_label,
+                fault_localization=None,
+                weight_updates=[],
+                num_edits=0,
+                total_weight_change=0,
+                preservation_metrics={'already_correct': True}
+            )
+
+        # We want to make the target class have higher logit than current prediction
+        # Simple approach: increase target class weight, decrease predicted class weight
+
+        # Compute required logit change
+        target_logit = current_logits[target_label]
+        max_wrong_logit = current_logits[current_pred]
+        logit_gap = max_wrong_logit - target_logit + 1.0  # Add margin
+
+        if verbose:
+            logger.info(f"  Target logit: {target_logit:.4f}, Max wrong logit: {max_wrong_logit:.4f}")
+            logger.info(f"  Need to increase target by at least: {logit_gap:.4f}")
+
+        # Create a rank-1 update to the head weights
+        # delta_W should satisfy: delta_W @ h increases logit[target_label] by logit_gap
+        # Simple solution: delta_W[target_label, :] = (logit_gap / ||h||^2) * h
+
+        h_norm_sq = np.dot(h, h)
+        delta_W = np.zeros_like(W_head)
+
+        # Increase target class weight
+        delta_W[target_label, :] = (logit_gap / h_norm_sq) * h
+
+        # Optionally decrease the wrongly predicted class
+        delta_W[current_pred, :] = -(logit_gap / 2 / h_norm_sq) * h
+
+        if verbose:
+            logger.info(f"  Weight update norm: {np.linalg.norm(delta_W):.6f}")
+
+        # Apply update to head
+        with torch.no_grad():
+            self.model.head.weight.add_(
+                torch.tensor(delta_W, device=self.model.head.weight.device,
+                            dtype=self.model.head.weight.dtype)
+            )
+
+        # Verify correction
+        with torch.no_grad():
+            final_output = self.model(image)
+            final_pred = final_output.cpu().numpy()
+
+        success = final_pred.argmax() == target_label
+
+        if verbose:
+            logger.info(f"Correction {'successful' if success else 'failed'}: "
+                       f"Original={original_pred.argmax()}, Final={final_pred.argmax()}, Target={target_label}")
+
+        return EditingResult(
+            success=success,
+            original_prediction=original_pred,
+            corrected_prediction=final_pred,
+            target_label=target_label,
+            fault_localization=None,
+            weight_updates=[],
+            num_edits=1,
+            total_weight_change=float(np.linalg.norm(delta_W)),
+            preservation_metrics={
+                'method': 'head_edit',
+                'logit_gap': float(logit_gap)
+            }
+        )
+
+    def correct_error_nullspace_direct(
+        self,
+        image: torch.Tensor,
+        target_label: int,
+        num_steps: int = 100,
+        lr: float = 0.05,
+        l2_weight: float = 0.0001,
+        nullspace_weight: float = 1.0,
+        verbose: bool = True
+    ) -> EditingResult:
+        """
+        Direct optimization of ΔW with null-space constraint as soft penalty.
+
+        This combines the best of both worlds:
+        - End-to-end optimization like Method 3 (accounts for k* changes)
+        - Null-space constraint like Method 1 (preserves knowledge)
+
+        The optimization objective is:
+        min_ΔW: -log P(target | x; W + ΔW) + λ₁||ΔW||² + λ₂||ΔW @ K₀||²
+
+        The third term penalizes changes that affect correct sample activations.
+
+        Args:
+            image: Input image that produces error
+            target_label: Correct label for this image
+            num_steps: Number of optimization steps
+            lr: Learning rate
+            l2_weight: Weight for L2 regularization on ΔW
+            nullspace_weight: Weight for null-space preservation penalty
+            verbose: Whether to print progress
+
+        Returns:
+            EditingResult with complete correction information
+        """
+        self.model.train(False)
+        image = image.to(self.device)
+
+        # Get original prediction
+        with torch.no_grad():
+            original_output = self.model(image)
+            original_pred = original_output.cpu().numpy()
+
+        if verbose:
+            logger.info(f"Null-space Direct: Original={original_pred.argmax()}, Target={target_label}")
+
+        # Get reference activations K_0 for the target class
+        if target_label not in self.reference_activations:
+            logger.warning(f"No reference activations for class {target_label}")
+            return EditingResult(
+                success=False, original_prediction=original_pred,
+                corrected_prediction=original_pred, target_label=target_label,
+                fault_localization=None, weight_updates=[], num_edits=0,
+                total_weight_change=0, preservation_metrics={'error': 'no_reference_activations'}
+            )
+
+        K_0 = self.reference_activations[target_label]  # [fc1_dim x num_samples]
+        K_0_tensor = torch.tensor(K_0, dtype=torch.float32, device=self.device)
+
+        # Get fc2 module at target layer
+        fc2_module = self.model.blocks[self.target_layer].mlp.fc2
+
+        # Save original fc2 weight
+        original_weight = fc2_module.weight.data.clone()
+
+        # Initialize ΔW as trainable parameter
+        delta_W = torch.zeros_like(original_weight, requires_grad=True, device=self.device)
+        optimizer = torch.optim.Adam([delta_W], lr=lr)
+
+        # Target tensor
+        target_tensor = torch.tensor([target_label], dtype=torch.long, device=self.device)
+
+        best_delta_W = None
+        best_loss = float('inf')
+
+        for step in range(num_steps):
+            optimizer.zero_grad()
+
+            # Hook to modify fc2 output with gradient-enabled perturbation
+            def modify_fc2_output(module, inp, out):
+                fc1_out = inp[0]  # [batch, num_patches, fc1_dim]
+                perturbation = torch.matmul(fc1_out, delta_W.T)
+                return out + perturbation
+
+            hook_fc2 = fc2_module.register_forward_hook(modify_fc2_output)
+
+            try:
+                # Forward pass with perturbation
+                output = self.model(image)
+
+                # Loss 1: Cross-entropy for correction
+                ce_loss = F.cross_entropy(output, target_tensor)
+
+                # Loss 2: L2 regularization on ΔW
+                l2_loss = l2_weight * torch.sum(delta_W ** 2)
+
+                # Loss 3: Null-space preservation penalty ||ΔW @ K_0||²
+                # This encourages ΔW to be in the null-space of K_0
+                preservation_term = torch.matmul(delta_W, K_0_tensor)  # [hidden_dim x num_samples]
+                preservation_loss = nullspace_weight * torch.mean(preservation_term ** 2)
+
+                total_loss = ce_loss + l2_loss + preservation_loss
+
+                # Backward
+                total_loss.backward()
+                optimizer.step()
+
+            finally:
+                hook_fc2.remove()
+
+            # Track best
+            if total_loss.item() < best_loss:
+                best_loss = total_loss.item()
+                best_delta_W = delta_W.detach().clone()
+
+            if verbose and (step + 1) % 20 == 0:
+                pred = output.argmax().item()
+                prob = F.softmax(output, dim=1)[0, target_label].item()
+                pres_err = preservation_loss.item()
+                logger.info(f"  Step {step + 1}: loss={total_loss.item():.4f}, "
+                           f"pred={pred}, P(target)={prob:.4f}, pres_loss={pres_err:.4f}")
+
+            # Early stopping if successful
+            if output.argmax().item() == target_label:
+                best_delta_W = delta_W.detach().clone()
+                if verbose:
+                    logger.info(f"  Correction achieved at step {step + 1}")
+                break
+
+        # Apply best ΔW permanently
+        with torch.no_grad():
+            fc2_module.weight.data = original_weight + best_delta_W
+
+        # Verify final prediction
+        with torch.no_grad():
+            final_output = self.model(image)
+            final_pred = final_output.cpu().numpy()
+
+        success = final_pred.argmax() == target_label
+
+        # Compute preservation error
+        with torch.no_grad():
+            preservation_output = torch.matmul(best_delta_W, K_0_tensor)
+            preservation_error = torch.mean(preservation_output ** 2).item()
+
+        if verbose:
+            logger.info(f"Null-space Direct: {'SUCCESS' if success else 'FAILED'}, "
+                       f"Final={final_pred.argmax()}, ||ΔW||={best_delta_W.norm().item():.4f}, "
+                       f"pres_err={preservation_error:.6f}")
+
+        return EditingResult(
+            success=success,
+            original_prediction=original_pred,
+            corrected_prediction=final_pred,
+            target_label=target_label,
+            fault_localization=None,
+            weight_updates=[],
+            num_edits=1,
+            total_weight_change=float(best_delta_W.norm().item()),
+            preservation_metrics={
+                'method': 'nullspace_direct',
+                'num_steps': step + 1,
+                'final_loss': best_loss,
+                'preservation_error': preservation_error
+            }
+        )
+
+    def correct_error_nullspace_iterative(
+        self,
+        image: torch.Tensor,
+        target_label: int,
+        num_outer_iterations: int = 5,
+        num_v_star_steps: int = 50,
+        v_star_lr: float = 1.0,
+        verbose: bool = True
+    ) -> EditingResult:
+        """
+        Improved null-space constrained editing with iterative refinement.
+
+        Key insight: The problem with Method 1 is that k* changes after weight update.
+        Solution: Use a stronger v* optimization (more steps, higher lr) so that the
+        initial ΔW is large enough to flip the prediction in one shot.
+
+        Additionally, we use iterative refinement where we:
+        1. Optimize v* with strong constraints
+        2. Apply ΔW
+        3. Check if prediction flipped
+        4. If not, repeat with updated k*
+
+        Args:
+            image: Input image that produces error
+            target_label: Correct label for this image
+            num_outer_iterations: Number of outer refinement iterations
+            num_v_star_steps: Steps for v* optimization (more = stronger)
+            v_star_lr: Learning rate for v* optimization (higher = more aggressive)
+            verbose: Whether to print progress
+
+        Returns:
+            EditingResult with complete correction information
+        """
+        self.model.train(False)
+        image = image.to(self.device)
+
+        # Get original prediction
+        with torch.no_grad():
+            original_output = self.model(image)
+            original_pred = original_output.cpu().numpy()
+
+        if verbose:
+            logger.info(f"Null-space Iterative: Original={original_pred.argmax()}, Target={target_label}")
+
+        # Get projection matrix
+        projection_result = self.get_projection_matrix(target_label, verbose=False)
+        if projection_result is None:
+            return EditingResult(
+                success=False, original_prediction=original_pred,
+                corrected_prediction=original_pred, target_label=target_label,
+                fault_localization=None, weight_updates=[], num_edits=0,
+                total_weight_change=0, preservation_metrics={'error': 'no_reference_activations'}
+            )
+
+        P = projection_result.projection_matrix
+        K_0 = self.reference_activations.get(target_label)
+
+        # Save original weights
+        fc2_module = self.model.blocks[self.target_layer].mlp.fc2
+        original_fc2_weight = fc2_module.weight.data.clone()
+
+        weight_updates = []
+        total_weight_change = 0.0
+
+        for iteration in range(num_outer_iterations):
+            # Check current prediction
+            with torch.no_grad():
+                current_output = self.model(image)
+                current_pred = current_output.argmax().item()
+
+            if current_pred == target_label:
+                if verbose:
+                    logger.info(f"  Iteration {iteration}: SUCCESS!")
+                break
+
+            if verbose:
+                logger.info(f"  Iteration {iteration}: pred={current_pred}, optimizing v*...")
+
+            # Get current k* (this changes after each weight update!)
+            k_star = self.get_fc1_activation(image)
+
+            # Optimize v* with stronger settings
+            v_star = self._optimize_target_activation(
+                image, target_label,
+                num_steps=num_v_star_steps,
+                lr=v_star_lr,
+                kl_weight=0.01,  # Lower regularization = more aggressive
+                verbose=False
+            )
+
+            if v_star is None:
+                break
+
+            # Get current weights
+            _, W = self.get_fc2_weights()
+
+            # Compute ΔW using null-space projection
+            update_result = self.null_space_projector.compute_weight_update(
+                W, k_star, v_star, P, K_0=K_0, verbose=False
+            )
+
+            # Scale the update for more aggressive correction
+            scale_factor = 2.0 if iteration == 0 else 1.0
+            scaled_delta_W = update_result.delta_W * scale_factor
+
+            # Apply update
+            self.apply_weight_update(scaled_delta_W)
+
+            weight_updates.append(update_result)
+            total_weight_change += np.linalg.norm(scaled_delta_W)
+
+            if verbose:
+                logger.info(f"    ||ΔW||={np.linalg.norm(scaled_delta_W):.4f}")
+
+        # Get final prediction
+        with torch.no_grad():
+            final_output = self.model(image)
+            final_pred = final_output.cpu().numpy()
+
+        success = final_pred.argmax() == target_label
+
+        if verbose:
+            logger.info(f"Null-space Iterative: {'SUCCESS' if success else 'FAILED'}, "
+                       f"Final={final_pred.argmax()}")
+
+        return EditingResult(
+            success=success,
+            original_prediction=original_pred,
+            corrected_prediction=final_pred,
+            target_label=target_label,
+            fault_localization=None,
+            weight_updates=weight_updates,
+            num_edits=len(weight_updates),
+            total_weight_change=total_weight_change,
+            preservation_metrics={
+                'method': 'nullspace_iterative',
+                'iterations': iteration + 1,
+                'null_space_dim': projection_result.null_space_dim
+            }
+        )
 
     def correct_error(
         self,
@@ -512,8 +1236,13 @@ class MedicalAlphaEdit:
             if verbose and edit_num == 0:
                 logger.info(f"  k* (fc1 activation) shape: {k_star.shape}")
 
-            # Retrieve target activation v*
-            v_star = self.retrieve_target_activation(k_star, target_label, method='nearest')
+            # Retrieve target activation v* using ROME/MEMIT gradient optimization
+            # This optimizes v* = v + delta to maximize P(target_label | image)
+            if verbose and edit_num == 0:
+                logger.info("  Computing v* via gradient optimization (ROME/MEMIT style)...")
+            v_star = self.retrieve_target_activation(
+                k_star, target_label, method='gradient', image=image, verbose=(verbose and edit_num == 0)
+            )
             if v_star is None:
                 logger.warning(f"Could not retrieve target activation for class {target_label}")
                 break
@@ -533,9 +1262,12 @@ class MedicalAlphaEdit:
             assert v_star.shape[0] == W.shape[0], \
                 f"Output dimension mismatch: v*={v_star.shape}, W={W.shape}"
 
+            # Get K_0 for preservation verification
+            K_0 = self.reference_activations.get(target_label)
+
             # Compute weight update using null-space projection
             update_result = self.null_space_projector.compute_weight_update(
-                W, k_star, v_star, P, verbose=(verbose and edit_num == 0)
+                W, k_star, v_star, P, K_0=K_0, verbose=(verbose and edit_num == 0)
             )
 
             weight_updates.append(update_result)

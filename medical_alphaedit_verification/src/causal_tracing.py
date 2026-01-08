@@ -347,26 +347,27 @@ class CausalTracer:
             if 'attn_input' not in storage:
                 return np.ones(self.num_patches) * 2.5
 
-            x = storage['attn_input']
+            x = storage['attn_input'].detach()  # Fix: detach to avoid grad issues
             B, N, C = x.shape
 
             # Compute QKV projection
             if hasattr(attn_module, 'qkv'):
-                qkv = attn_module.qkv(x)
-                num_heads = attn_module.num_heads
-                head_dim = C // num_heads
+                with torch.no_grad():  # Ensure no grad computation
+                    qkv = attn_module.qkv(x)
+                    num_heads = attn_module.num_heads
+                    head_dim = C // num_heads
 
-                qkv = qkv.reshape(B, N, 3, num_heads, head_dim).permute(2, 0, 3, 1, 4)
-                q, k, v = qkv[0], qkv[1], qkv[2]
+                    qkv = qkv.reshape(B, N, 3, num_heads, head_dim).permute(2, 0, 3, 1, 4)
+                    q, k, v = qkv[0], qkv[1], qkv[2]
 
-                # Compute attention weights
-                scale = head_dim ** -0.5
-                attn_weights = (q @ k.transpose(-2, -1)) * scale
-                attn_weights = F.softmax(attn_weights, dim=-1)  # [B, heads, N, N]
+                    # Compute attention weights
+                    scale = head_dim ** -0.5
+                    attn_weights = (q @ k.transpose(-2, -1)) * scale
+                    attn_weights = F.softmax(attn_weights, dim=-1)  # [B, heads, N, N]
 
-                # Compute entropy
-                entropy = self.compute_attention_entropy(attn_weights)
-                return entropy[0].cpu().numpy()  # [N]
+                    # Compute entropy
+                    entropy = self.compute_attention_entropy(attn_weights)
+                    return entropy[0].detach().cpu().numpy()  # [N]
 
         except Exception as e:
             logger.warning(f"Failed to compute attention entropy: {e}")
@@ -384,7 +385,10 @@ class CausalTracer:
         patch_idx: int,
         layer_idx: int,
         component: str = 'mlp',
-        clean_activations: Optional[Dict[str, torch.Tensor]] = None
+        clean_activations: Optional[Dict[str, torch.Tensor]] = None,
+        corrupted_image: Optional[torch.Tensor] = None,
+        clean_pred: Optional[torch.Tensor] = None,
+        corrupted_dist: Optional[float] = None
     ) -> float:
         """
         Compute causal effect using Corrupt-Restore methodology.
@@ -402,23 +406,28 @@ class CausalTracer:
             layer_idx: Which layer to restore
             component: 'mlp' or 'attn'
             clean_activations: Pre-computed clean activations (optional)
+            corrupted_image: Pre-computed corrupted image (for consistency across calls)
+            clean_pred: Pre-computed clean prediction
+            corrupted_dist: Pre-computed corrupted distance
 
         Returns:
             Recovery ratio (0 to 1+, higher = more important)
         """
         image = image.to(self.device)
 
-        # Step 1: Get clean prediction
-        with torch.no_grad():
-            clean_pred = self.model(image)
+        # Step 1: Get clean prediction (use cached if provided)
+        if clean_pred is None:
+            with torch.no_grad():
+                clean_pred = self.model(image)
 
-        # Step 2: Get corrupted prediction
-        corrupted_image = self.corrupt_input(image)
-        with torch.no_grad():
-            corrupted_pred = self.model(corrupted_image)
+        # Step 2: Get corrupted prediction (use cached if provided)
+        if corrupted_image is None:
+            corrupted_image = self.corrupt_input(image)
 
-        # Compute corrupted distance
-        corrupted_dist = torch.norm(clean_pred - corrupted_pred, p=2).item()
+        if corrupted_dist is None:
+            with torch.no_grad():
+                corrupted_pred = self.model(corrupted_image)
+            corrupted_dist = torch.norm(clean_pred - corrupted_pred, p=2).item()
 
         if corrupted_dist < 1e-8:
             return 0.0  # Corruption had no effect
@@ -569,8 +578,19 @@ class CausalTracer:
         # Pre-capture clean activations for restore method
         if method == 'restore':
             clean_activations = self.capture_clean_activations(image)
+            # Create corrupted image ONCE for consistency across all patches/layers
+            corrupted_image = self.corrupt_input(image)
+            with torch.no_grad():
+                clean_pred = self.model(image)
+                corrupted_pred = self.model(corrupted_image)
+            corrupted_dist = torch.norm(clean_pred - corrupted_pred, p=2).item()
+            if verbose:
+                logger.info(f"Corrupted distance from clean: {corrupted_dist:.4f}")
         else:
             clean_activations = None
+            corrupted_image = None
+            clean_pred = None
+            corrupted_dist = None
 
         # Analyze each layer
         for layer_idx in range(self.num_layers):
@@ -595,16 +615,22 @@ class CausalTracer:
                 attention_entropies[patch_idx, layer_idx] = attn_ent
 
                 if method == 'restore':
-                    # MLP causal effect
+                    # MLP causal effect (use consistent corrupted image)
                     mlp_ce = self.compute_causal_effect_restore(
-                        image, patch_idx, layer_idx, 'mlp', clean_activations
+                        image, patch_idx, layer_idx, 'mlp', clean_activations,
+                        corrupted_image=corrupted_image,
+                        clean_pred=clean_pred,
+                        corrupted_dist=corrupted_dist
                     )
                     mlp_causal_effects[patch_idx, layer_idx] = mlp_ce
                     mlp_fault_scores[patch_idx, layer_idx] = self.compute_fault_score(mlp_ce, attn_ent)
 
-                    # MSA causal effect
+                    # MSA causal effect (use consistent corrupted image)
                     msa_ce = self.compute_causal_effect_restore(
-                        image, patch_idx, layer_idx, 'attn', clean_activations
+                        image, patch_idx, layer_idx, 'attn', clean_activations,
+                        corrupted_image=corrupted_image,
+                        clean_pred=clean_pred,
+                        corrupted_dist=corrupted_dist
                     )
                     msa_causal_effects[patch_idx, layer_idx] = msa_ce
                     msa_fault_scores[patch_idx, layer_idx] = self.compute_fault_score(msa_ce, attn_ent)

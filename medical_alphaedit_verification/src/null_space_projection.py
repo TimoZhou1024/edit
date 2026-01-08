@@ -170,28 +170,34 @@ class NullSpaceProjector:
         k_star: np.ndarray,
         v_star: np.ndarray,
         P: np.ndarray,
+        K_0: Optional[np.ndarray] = None,
         verbose: bool = True
     ) -> WeightUpdateResult:
         """
         Compute constrained weight update Delta_W (Eq. 12)
 
-        Delta_W = (v* - W*k*) * (k*^T * P) * (k* * k*^T * P + lambda*I)^{-1}
+        The key insight: We need to find ΔW such that:
+        1. (W + ΔW) @ k* = v*  (error correction)
+        2. ΔW @ K_0 ≈ 0        (knowledge preservation)
 
-        This formulation guarantees:
-        1. Error Correction: (W + Delta_W) * k* = v*
-        2. Knowledge Preservation: (W + Delta_W) * K_0 = W * K_0
+        The solution uses the null-space projection to ensure ΔW only affects
+        directions orthogonal to the correct activations K_0.
+
+        Simplified formulation for rank-1 update:
+        ΔW = (v* - W @ k*) @ (P @ k*)^T / (k*^T @ P @ k* + λ)
 
         Args:
             W: Original weight matrix [d_out x d_in]
             k_star: Faulty activation vector [d_in]
             v_star: Target corrected activation [d_out]
             P: Null-space projection matrix [d_in x d_in]
+            K_0: Correct activations for preservation verification [d_in x m]
 
         Returns:
             WeightUpdateResult containing the update and verification metrics
         """
         if verbose:
-            logger.info(f"Computing weight update:")
+            logger.info("Computing weight update:")
             logger.info(f"  W shape: {W.shape}")
             logger.info(f"  k* shape: {k_star.shape}")
             logger.info(f"  v* shape: {v_star.shape}")
@@ -201,51 +207,56 @@ class NullSpaceProjector:
         k_star = k_star.flatten()
         v_star = v_star.flatten()
 
-        # Compute the residual (v* - W*k*)
+        # Compute the residual (v* - W @ k*)
         current_output = W @ k_star
         residual = v_star - current_output
 
         if verbose:
             logger.info(f"  Residual norm: {np.linalg.norm(residual):.6f}")
 
-        # Project k* onto null space: P * k*
+        # Project k* onto null space: P @ k*
         Pk_star = P @ k_star
+        Pk_star_norm = np.linalg.norm(Pk_star)
+        k_star_norm = np.linalg.norm(k_star)
 
         if verbose:
-            logger.info(f"  ||P*k*|| / ||k*||: {np.linalg.norm(Pk_star) / (np.linalg.norm(k_star) + 1e-10):.6f}")
+            logger.info(f"  ||P @ k*|| / ||k*||: {Pk_star_norm / (k_star_norm + 1e-10):.6f}")
 
-        # Compute (k* * k*^T * P + lambda*I)
-        # This is a scalar when k* is a vector
-        k_star_T_P = k_star @ P  # [d_in]
-        denominator_matrix = np.outer(k_star, k_star_T_P) + self.regularization * np.eye(len(k_star))
+        # Check if k* has sufficient component in null space
+        if Pk_star_norm < 1e-8:
+            logger.warning("k* has negligible null-space component, update will be ineffective")
+            # Fall back to unconstrained update with small step
+            delta_W = np.outer(residual, k_star) / (np.dot(k_star, k_star) + self.regularization)
+        else:
+            # Compute denominator: k*^T @ P @ k* + λ
+            denominator = np.dot(k_star, Pk_star) + self.regularization
 
-        # Compute pseudo-inverse for stability
-        try:
-            denominator_inv = np.linalg.inv(denominator_matrix)
-        except np.linalg.LinAlgError:
-            logger.warning("Matrix inversion failed, using pseudo-inverse")
-            denominator_inv = np.linalg.pinv(denominator_matrix)
-
-        # Compute Delta_W = residual * (k*^T * P) * inverse_term
-        # This is an outer product: [d_out] x [d_in]
-        delta_W = np.outer(residual, k_star_T_P @ denominator_inv)
+            # Compute Delta_W = residual @ (P @ k*)^T / denominator
+            # This is a rank-1 update: [d_out] x [d_in]
+            delta_W = np.outer(residual, Pk_star) / denominator
 
         # Compute updated weights
         updated_W = W + delta_W
 
-        # Verify correction: (W + Delta_W) * k* should equal v*
+        # Verify correction: (W + ΔW) @ k* should approach v*
         corrected_output = updated_W @ k_star
         correction_error = np.linalg.norm(corrected_output - v_star)
 
         if verbose:
             logger.info(f"  Correction error: {correction_error:.6e}")
 
-        # For preservation verification, we need the original correct activations
-        # Here we just compute the projection of delta_W to verify it's in null space
-        preservation_error = np.linalg.norm((np.eye(P.shape[0]) - P) @ delta_W.T)
+        # Compute preservation error using actual K_0 if provided
+        if K_0 is not None:
+            # ΔW @ K_0 should be approximately zero
+            preservation = delta_W @ K_0
+            preservation_error = np.linalg.norm(preservation) / np.linalg.norm(K_0)
+        else:
+            # Fallback: check that ΔW is in the null-space direction
+            # (I - P) @ delta_W.T should be small
+            preservation_error = np.linalg.norm((np.eye(P.shape[0]) - P) @ delta_W.T) / (np.linalg.norm(delta_W) + 1e-10)
 
         if verbose:
-            logger.info(f"  Preservation error (should be ~0): {preservation_error:.6e}")
+            logger.info(f"  Preservation error: {preservation_error:.6e}")
 
         return WeightUpdateResult(
             delta_W=delta_W,
