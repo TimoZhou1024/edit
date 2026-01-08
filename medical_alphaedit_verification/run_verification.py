@@ -413,56 +413,65 @@ def run_medmnist_verification(
             # ═══════════════════════════════════════════════════════════════
             # Real Corrupt-Restore causal tracing
             # ═══════════════════════════════════════════════════════════════
-            print(f"   Running REAL fault localization (max_patches={causal_tracing_max_patches})...")
+            print("   Running REAL fault localization (layer-level detailed tracing)...")
             print("   This may take a few minutes...")
 
             import time
             start_time = time.time()
 
-            # Run actual fault localization
-            fault_result = tracer.localize_faults(
+            # Run detailed fault localization (layer-level) and save CSV
+            fault_result, detailed_records = tracer.localize_faults_detailed(
                 image=sample_image,
-                top_m=5,
                 verbose=True,
-                method='restore',
-                max_patches=causal_tracing_max_patches
+                include_msa=False
+            )
+
+            csv_path = output_dir / 'causal_tracing_detailed.csv'
+            tracer.save_detailed_records_csv(
+                records=detailed_records,
+                output_path=str(csv_path),
+                corrupted_dist=fault_result.corrupted_dist
             )
 
             elapsed_time = time.time() - start_time
             print(f"   Fault localization completed in {elapsed_time:.1f} seconds")
+            print(f"   Detailed tracing CSV saved to: {csv_path}")
 
             # Extract results
-            fault_scores = fault_result.fault_scores
             critical_components = fault_result.critical_components
 
-            print("   Top 5 critical components (REAL):")
+            print("   Top critical layers (REAL, detailed):")
             for rank, (patch_idx, layer_idx, component_type) in enumerate(critical_components[:5], 1):
-                if component_type == 'mlp':
-                    score = fault_result.mlp_fault_scores[patch_idx, layer_idx]
+                if component_type == 'mlp' and fault_result.mlp_fault_scores is not None:
+                    score = fault_result.mlp_fault_scores[0, layer_idx]
+                elif component_type == 'msa' and fault_result.msa_fault_scores is not None:
+                    score = fault_result.msa_fault_scores[0, layer_idx]
                 else:
-                    score = fault_result.msa_fault_scores[patch_idx, layer_idx]
-                print(f"      {rank}. Patch {patch_idx}, Layer {layer_idx}, {component_type.upper()}: score = {score:.4f}")
+                    score = fault_result.fault_scores[0, layer_idx]
+                print(f"      {rank}. Layer {layer_idx}, {component_type.upper()}: score = {score:.4f}")
 
-            # Extract the most critical layer for editing (from MLP components)
+            # Extract the most critical layer for editing (prefer MLP components)
             mlp_components = [(p, layer, t) for p, layer, t in critical_components if t == 'mlp']
             if mlp_components:
-                critical_layer = mlp_components[0][1]  # Layer index from top MLP component
+                critical_layer = mlp_components[0][1]
             else:
                 critical_layer = critical_components[0][1] if critical_components else 11
 
             results['causal_tracing'] = {
-                'method': 'real_corrupt_restore',
+                'method': 'real_corrupt_restore_detailed',
                 'sample_true_label': sample_label,
                 'sample_predicted': sample_info['predicted'],
-                'num_patches_analyzed': causal_tracing_max_patches,
+                'num_patches_analyzed': 1,
                 'num_layers_analyzed': num_layers,
                 'elapsed_time_seconds': elapsed_time,
+                'corrupted_distance': fault_result.corrupted_dist,
                 'critical_components': [
                     {'patch': patch, 'layer': layer, 'type': comp_type}
                     for patch, layer, comp_type in critical_components[:5]
                 ],
                 'top_components': [(patch, layer) for patch, layer, _ in critical_components[:5]],
-                'critical_layer_for_editing': critical_layer
+                'critical_layer_for_editing': critical_layer,
+                'detailed_csv': str(csv_path)
             }
 
         else:

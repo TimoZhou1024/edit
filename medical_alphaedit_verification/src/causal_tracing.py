@@ -29,6 +29,20 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
+class TracingDetailRecord:
+    """Single record of detailed causal tracing for one (layer, component) pair."""
+    layer_idx: int
+    component: str  # 'mlp' or 'msa'
+    corrupted_dist: float
+    restored_dist: float
+    recovery: float  # corrupted_dist - restored_dist
+    recovery_ratio: float  # recovery / corrupted_dist
+    attention_entropy: float  # H(attention)
+    exp_entropy: float  # exp(H(attention) * 0.5)
+    fault_score: float  # recovery_ratio * exp_entropy
+
+
+@dataclass
 class FaultLocalizationResult:
     """Container for fault localization results."""
     patch_indices: List[int]
@@ -42,6 +56,10 @@ class FaultLocalizationResult:
     msa_fault_scores: Optional[np.ndarray] = None
     mlp_causal_effects: Optional[np.ndarray] = None
     msa_causal_effects: Optional[np.ndarray] = None
+    # Detailed tracing records for table output
+    detailed_records: Optional[List[TracingDetailRecord]] = None
+    # Global metrics
+    corrupted_dist: Optional[float] = None
 
 
 class ActivationCaptureHook:
@@ -388,8 +406,9 @@ class CausalTracer:
         clean_activations: Optional[Dict[str, torch.Tensor]] = None,
         corrupted_image: Optional[torch.Tensor] = None,
         clean_pred: Optional[torch.Tensor] = None,
-        corrupted_dist: Optional[float] = None
-    ) -> float:
+        corrupted_dist: Optional[float] = None,
+        return_details: bool = False
+    ) -> Union[float, Tuple[float, float]]:
         """
         Compute causal effect using Corrupt-Restore methodology.
 
@@ -409,9 +428,11 @@ class CausalTracer:
             corrupted_image: Pre-computed corrupted image (for consistency across calls)
             clean_pred: Pre-computed clean prediction
             corrupted_dist: Pre-computed corrupted distance
+            return_details: If True, also return restored_dist
 
         Returns:
-            Recovery ratio (0 to 1+, higher = more important)
+            If return_details=False: Recovery ratio (0 to 1+, higher = more important)
+            If return_details=True: Tuple of (recovery_ratio, restored_dist)
         """
         image = image.to(self.device)
 
@@ -430,6 +451,8 @@ class CausalTracer:
             corrupted_dist = torch.norm(clean_pred - corrupted_pred, p=2).item()
 
         if corrupted_dist < 1e-8:
+            if return_details:
+                return 0.0, 0.0
             return 0.0  # Corruption had no effect
 
         # Step 3: Capture clean activations if not provided
@@ -439,6 +462,8 @@ class CausalTracer:
         # Step 4: Restore clean activation and measure recovery
         act_key = f"{component}_{layer_idx}"
         if act_key not in clean_activations:
+            if return_details:
+                return 0.0, corrupted_dist
             return 0.0
 
         clean_act = clean_activations[act_key]
@@ -448,6 +473,8 @@ class CausalTracer:
         target_module = mlp if component == 'mlp' else attn
 
         if target_module is None:
+            if return_details:
+                return 0.0, corrupted_dist
             return 0.0
 
         # Create restore hook
@@ -462,7 +489,11 @@ class CausalTracer:
 
             # Recovery = how much closer to clean prediction
             recovery = (corrupted_dist - restored_dist) / corrupted_dist
-            return max(0.0, recovery)  # Clip negative values
+            recovery_ratio = max(0.0, recovery)  # Clip negative values
+
+            if return_details:
+                return recovery_ratio, restored_dist
+            return recovery_ratio
 
         finally:
             handle.remove()
@@ -689,6 +720,295 @@ class CausalTracer:
             mlp_causal_effects=mlp_causal_effects,
             msa_causal_effects=msa_causal_effects
         )
+
+    def localize_faults_detailed(
+        self,
+        image: torch.Tensor,
+        verbose: bool = True,
+        include_msa: bool = False
+    ) -> Tuple[FaultLocalizationResult, List[TracingDetailRecord]]:
+        """
+        Perform fault localization with detailed per-layer tracing records.
+
+        This method focuses on layer-level analysis (aggregating across patches)
+        since MLP editing targets entire layers, not individual patches.
+
+        The detailed records contain all intermediate values for analysis:
+        - corrupted_dist: ||y_clean - y_corrupt||
+        - restored_dist: ||y_clean - y_restored|| after restoring layer
+        - recovery: corrupted_dist - restored_dist
+        - recovery_ratio: recovery / corrupted_dist
+        - attention_entropy: H(A^l) averaged across patches
+        - exp_entropy: exp(H * 0.5)
+        - fault_score: recovery_ratio * exp_entropy
+
+        Args:
+            image: Input medical image [1, C, H, W]
+            verbose: Whether to print progress
+            include_msa: Whether to also trace MSA components (default False)
+
+        Returns:
+            Tuple of (FaultLocalizationResult, List[TracingDetailRecord])
+        """
+        self.model.eval()
+        image = image.to(self.device)
+
+        if verbose:
+            logger.info(f"Starting detailed fault localization across {self.num_layers} layers")
+            logger.info(f"Components: MLP" + (" + MSA" if include_msa else " only"))
+
+        # Capture clean activations for all layers
+        clean_activations = self.capture_clean_activations(image)
+
+        # Create corrupted image ONCE
+        corrupted_image = self.corrupt_input(image)
+
+        with torch.no_grad():
+            clean_pred = self.model(image)
+            corrupted_pred = self.model(corrupted_image)
+
+        corrupted_dist = torch.norm(clean_pred - corrupted_pred, p=2).item()
+
+        if verbose:
+            logger.info(f"Corrupted distance from clean: {corrupted_dist:.6f}")
+
+        # Collect detailed records for each layer
+        detailed_records: List[TracingDetailRecord] = []
+
+        # For storing aggregated scores
+        mlp_layer_scores = np.zeros(self.num_layers)
+        msa_layer_scores = np.zeros(self.num_layers)
+        mlp_layer_recovery = np.zeros(self.num_layers)
+        msa_layer_recovery = np.zeros(self.num_layers)
+        layer_entropies = np.zeros(self.num_layers)
+
+        for layer_idx in range(self.num_layers):
+            if verbose:
+                logger.info(f"Processing layer {layer_idx + 1}/{self.num_layers}")
+
+            # Get average attention entropy for this layer
+            layer_entropy_arr = self.estimate_attention_entropy(image, layer_idx)
+            avg_entropy = float(np.mean(layer_entropy_arr))
+            layer_entropies[layer_idx] = avg_entropy
+
+            # Compute exp(H * 0.5) - the scaling factor
+            exp_entropy = np.exp(min(avg_entropy, 6.0) * 0.5)
+
+            # ===== MLP Component =====
+            # Restore ALL patches for this layer's MLP to get layer-level effect
+            mlp_recovery_ratio, mlp_restored_dist = self._compute_layer_causal_effect(
+                image=image,
+                layer_idx=layer_idx,
+                component='mlp',
+                clean_activations=clean_activations,
+                corrupted_image=corrupted_image,
+                clean_pred=clean_pred,
+                corrupted_dist=corrupted_dist
+            )
+
+            mlp_recovery = corrupted_dist - mlp_restored_dist
+            mlp_fault_score = mlp_recovery_ratio * exp_entropy
+
+            mlp_layer_scores[layer_idx] = mlp_fault_score
+            mlp_layer_recovery[layer_idx] = mlp_recovery_ratio
+
+            detailed_records.append(TracingDetailRecord(
+                layer_idx=layer_idx,
+                component='mlp',
+                corrupted_dist=corrupted_dist,
+                restored_dist=mlp_restored_dist,
+                recovery=mlp_recovery,
+                recovery_ratio=mlp_recovery_ratio,
+                attention_entropy=avg_entropy,
+                exp_entropy=exp_entropy,
+                fault_score=mlp_fault_score
+            ))
+
+            if verbose:
+                logger.info(f"  MLP: restored_dist={mlp_restored_dist:.4f}, "
+                           f"recovery_ratio={mlp_recovery_ratio:.4f}, "
+                           f"fault_score={mlp_fault_score:.4f}")
+
+            # ===== MSA Component (optional) =====
+            if include_msa:
+                msa_recovery_ratio, msa_restored_dist = self._compute_layer_causal_effect(
+                    image=image,
+                    layer_idx=layer_idx,
+                    component='attn',
+                    clean_activations=clean_activations,
+                    corrupted_image=corrupted_image,
+                    clean_pred=clean_pred,
+                    corrupted_dist=corrupted_dist
+                )
+
+                msa_recovery = corrupted_dist - msa_restored_dist
+                msa_fault_score = msa_recovery_ratio * exp_entropy
+
+                msa_layer_scores[layer_idx] = msa_fault_score
+                msa_layer_recovery[layer_idx] = msa_recovery_ratio
+
+                detailed_records.append(TracingDetailRecord(
+                    layer_idx=layer_idx,
+                    component='msa',
+                    corrupted_dist=corrupted_dist,
+                    restored_dist=msa_restored_dist,
+                    recovery=msa_recovery,
+                    recovery_ratio=msa_recovery_ratio,
+                    attention_entropy=avg_entropy,
+                    exp_entropy=exp_entropy,
+                    fault_score=msa_fault_score
+                ))
+
+                if verbose:
+                    logger.info(f"  MSA: restored_dist={msa_restored_dist:.4f}, "
+                               f"recovery_ratio={msa_recovery_ratio:.4f}, "
+                               f"fault_score={msa_fault_score:.4f}")
+
+        # Find top critical layers
+        top_mlp_layers = np.argsort(mlp_layer_scores)[-5:][::-1]
+        critical_components = [(0, int(layer), 'mlp') for layer in top_mlp_layers if mlp_layer_scores[layer] > 0]
+
+        if include_msa:
+            top_msa_layers = np.argsort(msa_layer_scores)[-5:][::-1]
+            critical_components.extend([(0, int(layer), 'msa') for layer in top_msa_layers if msa_layer_scores[layer] > 0])
+
+        # Sort by fault score
+        critical_components.sort(
+            key=lambda x: mlp_layer_scores[x[1]] if x[2] == 'mlp' else msa_layer_scores[x[1]],
+            reverse=True
+        )
+        critical_components = critical_components[:5]
+
+        # Create result (using layer-level scores, patch dimension = 1)
+        result = FaultLocalizationResult(
+            patch_indices=[0],
+            layer_indices=[c[1] for c in critical_components],
+            fault_scores=mlp_layer_scores.reshape(1, -1),
+            attention_entropies=layer_entropies.reshape(1, -1),
+            causal_effects=mlp_layer_recovery.reshape(1, -1),
+            critical_components=critical_components,
+            mlp_fault_scores=mlp_layer_scores.reshape(1, -1),
+            msa_fault_scores=msa_layer_scores.reshape(1, -1) if include_msa else None,
+            mlp_causal_effects=mlp_layer_recovery.reshape(1, -1),
+            msa_causal_effects=msa_layer_recovery.reshape(1, -1) if include_msa else None,
+            detailed_records=detailed_records,
+            corrupted_dist=corrupted_dist
+        )
+
+        return result, detailed_records
+
+    def _compute_layer_causal_effect(
+        self,
+        image: torch.Tensor,
+        layer_idx: int,
+        component: str,
+        clean_activations: Dict[str, torch.Tensor],
+        corrupted_image: torch.Tensor,
+        clean_pred: torch.Tensor,
+        corrupted_dist: float
+    ) -> Tuple[float, float]:
+        """
+        Compute causal effect by restoring ALL patches for a layer's component.
+
+        This gives a layer-level aggregate effect rather than per-patch.
+
+        Returns:
+            Tuple of (recovery_ratio, restored_dist)
+        """
+        act_key = f"{component}_{layer_idx}"
+        if act_key not in clean_activations:
+            return 0.0, corrupted_dist
+
+        clean_act = clean_activations[act_key]
+
+        # Get the module to hook
+        attn, mlp = self._get_block_components(layer_idx)
+        target_module = mlp if component == 'mlp' else attn
+
+        if target_module is None:
+            return 0.0, corrupted_dist
+
+        # Create restore hook that restores ALL patches
+        restore_hook = RestoreHook(clean_act, [], restore_all=True)
+        handle = target_module.register_forward_hook(restore_hook)
+
+        try:
+            with torch.no_grad():
+                restored_pred = self.model(corrupted_image)
+
+            restored_dist = torch.norm(clean_pred - restored_pred, p=2).item()
+
+            # Recovery ratio
+            if corrupted_dist < 1e-8:
+                recovery_ratio = 0.0
+            else:
+                recovery_ratio = max(0.0, (corrupted_dist - restored_dist) / corrupted_dist)
+
+            return recovery_ratio, restored_dist
+
+        finally:
+            handle.remove()
+
+    def save_detailed_records_csv(
+        self,
+        records: List[TracingDetailRecord],
+        output_path: str,
+        corrupted_dist: Optional[float] = None
+    ) -> str:
+        """
+        Save detailed tracing records to a CSV file.
+
+        Args:
+            records: List of TracingDetailRecord objects
+            output_path: Path to save the CSV file
+            corrupted_dist: Global corrupted distance (optional, for header)
+
+        Returns:
+            Path to the saved file
+        """
+        import csv
+        from pathlib import Path
+
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        with open(output_path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+
+            # Write header with metadata
+            if corrupted_dist is not None:
+                writer.writerow([f"# Corrupted Distance: {corrupted_dist:.6f}"])
+                writer.writerow([])
+
+            # Column headers
+            writer.writerow([
+                'layer_idx',
+                'component',
+                'corrupted_dist',
+                'restored_dist',
+                'recovery',
+                'recovery_ratio',
+                'H(attention)',
+                'exp(H*0.5)',
+                'fault_score'
+            ])
+
+            # Data rows
+            for record in records:
+                writer.writerow([
+                    record.layer_idx,
+                    record.component,
+                    f"{record.corrupted_dist:.6f}",
+                    f"{record.restored_dist:.6f}",
+                    f"{record.recovery:.6f}",
+                    f"{record.recovery_ratio:.6f}",
+                    f"{record.attention_entropy:.6f}",
+                    f"{record.exp_entropy:.6f}",
+                    f"{record.fault_score:.6f}"
+                ])
+
+        logger.info(f"Saved detailed tracing records to: {output_path}")
+        return str(output_path)
 
     def cleanup(self):
         """Remove all registered hooks."""
